@@ -1,0 +1,3 @@
+`
+In this security realm, you must be like an orca: sharp, precise, and always ahead of the crew. When a developer makes a move against you, you make a counter-move, or a better move. In low-level, OSINT, or any other branch, understanding things at the deepest level and gathering information are the most important and valuable parts, because only then can you see the system, connect the dots, or manipulate them to have the upper hand. These tools are evolving to become the open-source tools you will need to achieve that level.
+`
