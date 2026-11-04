@@ -1,4 +1,4 @@
-## --Code2Asmx-- ##
+# --Code2Asmx-- #
 
 Source code to annotated assembly, from the terminal. It wraps gcc/clang, objdump and gdb
 and adds source mapping, noise filtering, demangling, highlighting and a dynamic tracer.
@@ -16,12 +16,15 @@ and adds source mapping, noise filtering, demangling, highlighting and a dynamic
 ## Requirements
 Python 3.8+, plus `gcc`/`g++`, `binutils` (objdump) and `gdb` for the modes that need them.
 
-# To use it just run : python3 Code2Asmx.py 'file_path' 'a flag'
+## To use it just run : python3 Code2Asmx.py 'file_path' 'a flag'
 
 
-## Example : a Snippet from an output against a networking C++ program:
+# Example: Tracing a C++ Network Program Implementation
 
-technotheos@HP-EliteBook-840-G8-PC:~/CodeToAssembly$ python3 Code2Asmx.py ../Tests/test.cpp --trace
+Below is a trace visualization from executing a low-level network binary, demonstrating real-time inspection of CPU instruction paths, active stack registers, and memory mappings.
+
+```text
+technotheos@HP-EliteBook-840-G8-PC:~/CodeToAssembly\$ python3 Code2Asmx.py ../Tests/test.cpp --trace
 
   ▄▀█ █▀ █▀▄▀█ ▀▄▀
   █▀█ ▄█ █░▀░█ █░█
@@ -129,3 +132,4 @@ technotheos@HP-EliteBook-840-G8-PC:~/CodeToAssembly$ python3 Code2Asmx.py ../Tes
   ▍  45 │ address.sin_port = htons(PORT);
   0027  0x401303  66 c7 44 24 12 1f 90     mov     WORD PTR [rsp+0x12], 0x901f
   ▍  47 │ if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
+```
