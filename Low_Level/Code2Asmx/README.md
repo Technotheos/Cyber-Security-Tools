@@ -15,7 +15,7 @@ well now we have a beautiful graph representation, it looks so appealing.
 
 **python3 Code2Asmx.py Tests/test.cpp --graph -f main -O0 --domain gojo**
 
-**python3 asmx.py Tests/test.cpp --graph --trace -f main -O0 --steps 600**
+**python3 Code2Asmx.py Tests/test.cpp --graph --trace -f main -O0 --steps 600**
 
 > **Warning:** `--trace` really executes the target. Only trace code you trust, and only
 > analyse software you are authorised to test.
