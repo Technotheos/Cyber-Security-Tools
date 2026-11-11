@@ -31,6 +31,13 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
+import bisect
+import codecs
+import ctypes
+import hashlib
+import signal
+from array import array
+from collections import Counter, defaultdict
 
 __version__ = "2.0.0"
 
@@ -40,12 +47,2431 @@ OPT_LEVELS = ("0", "1", "2", "3", "s", "z", "g", "fast")
 EXT_LANG = {".c": "c", ".cc": "c++", ".cpp": "c++", ".cxx": "c++", ".rs": "rust", ".py": "python"}
 TOOLS = {"c": ("gcc", "clang", "cc"), "c++": ("g++", "clang++", "c++"), "rust": ("rustc",)}
 IS_X86 = platform.machine().lower() in ("x86_64", "amd64", "i386", "i686")
+MASK = (1 << 64) - 1
 
+
+
+# ===========================================================================
+#  OMNI ENGINE  --  build pipeline, ptrace execution recorder, syscalls,
+#  heap model, taint + symbolic analysis, DWARF, typed graph, animated UI.
+#  Reached from the CLI via --omni (see bottom of this file for the hook).
+# ===========================================================================
 
 class AsmxError(Exception):
     def __init__(self, message, code=EXIT_FAIL, detail="", hint=""):
         super().__init__(message)
         self.code, self.detail, self.hint = code, detail, hint
+
+
+
+
+class OmniError(Exception):
+    def __init__(self, msg, hint=""):
+        super().__init__(msg)
+        self.hint = hint
+
+
+def sh(cmd, timeout=60, cwd=None, inp=None):
+    try:
+        r = subprocess.run([str(c) for c in cmd], capture_output=True, text=True, errors="replace",
+                           timeout=timeout, cwd=cwd, input=inp)
+        return r.returncode, r.stdout, r.stderr
+    except FileNotFoundError:
+        return 127, "", f"{cmd[0]}: not found"
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout"
+
+
+def hx(v):
+    return f"0x{v:x}"
+
+
+# =========================================================================== #
+#  1. BUILD PIPELINE                                                          #
+# =========================================================================== #
+def find_cc(lang, override):
+    if override:
+        return override
+    for t in (("g++", "clang++", "c++") if lang == "c++" else ("gcc", "clang", "cc")):
+        if shutil.which(t):
+            return t
+    raise OmniError("no C/C++ compiler found", "install gcc or clang")
+
+
+def _stage(name, cmd, out, cwd, timeout=60):
+    t = time.time()
+    rc, so, se = sh(cmd, timeout, cwd)
+    art = None
+    if out and Path(out).exists():
+        b = Path(out).read_bytes()
+        art = {"path": str(out), "name": Path(out).name, "bytes": len(b), "sha256": hashlib.sha256(b).hexdigest()[:16]}
+    return {"stage": name, "cmd": " ".join(shlex.quote(str(c)) for c in cmd), "rc": rc,
+            "ms": int((time.time() - t) * 1000), "artifact": art, "stderr": se.strip()[:1800]}
+
+
+def parse_opt_info(text, srcname):
+    """Compiler decisions from gcc -fopt-info-all."""
+    kinds = defaultdict(list)
+    missed = Counter()
+    for ln in text.splitlines():
+        m = re.match(r"^(.*?):(\d+):(\d+): (optimized|missed|note): (.*)$", ln)
+        if not m or Path(m.group(1)).name != srcname:
+            continue
+        kind, msg, line = m.group(4), m.group(5).strip(), int(m.group(2))
+        low = msg.lower()
+        if kind == "missed":
+            if "vectoriz" in low or "unroll" in low:
+                missed[re.sub(r"\d+", "N", msg)[:90]] += 1
+            continue
+        if kind != "optimized":
+            continue
+        cat = ("inlined" if "inlin" in low else "vectorized" if "vectoriz" in low else
+               "unrolled" if "unroll" in low else "eliminated" if re.search(r"remov|elimin|dead|propagat|fold", low)
+               else "loop" if "loop" in low else "other")
+        item = {"line": line, "msg": msg[:140]}
+        if item not in kinds[cat] and len(kinds[cat]) < 40:
+            kinds[cat].append(item)
+    return {"decisions": dict(kinds), "missed": missed.most_common(6)}
+
+
+def build_pipeline(src: Path, work: Path, opt, cc, flags, static):
+    stem = src.stem
+    pp = ".ii" if cc.endswith("++") else ".i"
+    fx = ["-fcf-protection=none"] if IS_X86 else []
+    stages = []
+    i_f, s_f, o_f, exe = work / f"{stem}{pp}", work / f"{stem}.s", work / f"{stem}.o", work / "target.bin"
+    stages.append(_stage("preprocess", [cc, "-E", src, "-o", i_f, *flags], i_f, src.parent))
+    stages.append(_stage("compile", [cc, "-S", f"-O{opt}", "-g", "-fno-pie", *fx, src, "-o", s_f, *flags], s_f, src.parent))
+    stages.append(_stage("assemble", [cc, "-c", s_f, "-o", o_f], o_f, work))
+    stages.append(_stage("link", [cc, "-no-pie", o_f, "-o", exe, *(["-static"] if static else []), *flags], exe, work))
+    for s in stages:
+        if s["rc"] != 0:
+            raise OmniError(f"{s['stage']} stage failed", s["stderr"] or "(no output)")
+    _, _, oi = sh([cc, "-c", f"-O{opt}", "-g", "-fno-pie", *fx, "-fopt-info-all", "-o", "/dev/null", src, *flags], 60, src.parent)
+    return stages, exe, parse_opt_info(oi, src.name)
+
+
+# --------------------------------------------------------------------------- #
+#  ELF facts: sections, symbols, relocations, PLT/GOT, libraries               #
+# --------------------------------------------------------------------------- #
+class SymTab:
+    """Address -> symbol for one object (exe or shared lib)."""
+
+    def __init__(self, path: str):
+        self.path = path
+        best = {}
+        _, out, _ = sh(["readelf", "-sW", path])
+        for ln in out.splitlines():
+            m = re.match(r"^\s*\d+:\s+([0-9a-f]+)\s+(\d+)\s+(\w+)\s+(\w+)\s+\w+\s+(\S+)\s+(\S+)", ln)
+            if not m or m.group(5) == "UND" or m.group(3) not in ("FUNC", "OBJECT", "IFUNC", "NOTYPE"):
+                continue
+            addr, size, name = int(m.group(1), 16), int(m.group(2)), m.group(6).split("@")[0]
+            if not addr or not name:
+                continue
+            cur = best.get(addr)
+            key = (name.startswith("_"), len(name))
+            if cur is None or key < cur[2]:
+                best[addr] = (name, size, key)
+        self.addrs = sorted(best)
+        self.info = [best[a] for a in self.addrs]
+        self.by_name = {best[a][0]: a for a in self.addrs}
+
+    def lookup(self, v):
+        i = bisect.bisect_right(self.addrs, v) - 1
+        if i < 0:
+            return None
+        a, (name, size, _) = self.addrs[i], self.info[i]
+        if (size and v < a + size) or (not size and v - a < 48):
+            return name, v - a
+        return None
+
+
+def elf_facts(exe: str, work: Path):
+    facts = {"sections": [], "relocs": [], "needed": [], "libs": [], "plt": {}, "type": "EXEC", "entry": 0}
+    _, out, _ = sh(["readelf", "-hW", exe])
+    m = re.search(r"Type:\s+(\w+)", out)
+    facts["type"] = m.group(1) if m else "EXEC"
+    m = re.search(r"Entry point address:\s+(0x[0-9a-f]+)", out)
+    facts["entry"] = int(m.group(1), 16) if m else 0
+    _, out, _ = sh(["readelf", "-SW", exe])
+    for ln in out.splitlines():
+        m = re.match(r"^\s*\[\s*\d+\]\s+(\S+)\s+(\S+)\s+([0-9a-f]{8,16})\s+([0-9a-f]+)\s+([0-9a-f]+)\s+[0-9a-f]+\s+(\S*)", ln)
+        if m:
+            facts["sections"].append({"name": m.group(1), "type": m.group(2), "addr": int(m.group(3), 16),
+                                      "off": int(m.group(4), 16), "size": int(m.group(5), 16), "flags": m.group(6)})
+    _, out, _ = sh(["readelf", "-rW", exe])
+    sect = ""
+    for ln in out.splitlines():
+        h = re.match(r"^Relocation section '([^']+)'", ln)
+        if h:
+            sect = h.group(1).split()[0]
+            continue
+        m = re.match(r"^([0-9a-f]{8,16})\s+([0-9a-f]+)\s+(\w+)\s+([0-9a-f]+)\s+(\S+)", ln)
+        if m:
+            facts["relocs"].append({"section": sect, "offset": int(m.group(1), 16), "type": m.group(3),
+                                    "sym": m.group(5).split("@")[0]})
+    _, out, _ = sh(["readelf", "-dW", exe])
+    facts["needed"] = re.findall(r"\(NEEDED\)\s+Shared library: \[(.+?)\]", out)
+    _, out, _ = sh(["ldd", exe])
+    for ln in out.splitlines():
+        m = re.match(r"^\s*(\S+)\s+=>\s+(\S+)", ln)
+        if m:
+            facts["libs"].append({"soname": m.group(1), "path": m.group(2)})
+    # PLT stubs: stub address -> {name, got}
+    for sec in (".plt", ".plt.sec", ".plt.got"):
+        _, out, _ = sh(["objdump", "-d", "-M", "intel", "-j", sec, exe])
+        cur = None
+        for ln in out.splitlines():
+            h = re.match(r"^([0-9a-f]+) <(.+?)>:", ln)
+            if h:
+                cur = (int(h.group(1), 16), h.group(2))
+                continue
+            j = re.search(r"jmp\s+.*#\s+([0-9a-f]+) <([^>]+)>", ln)
+            if j and cur:
+                nm = cur[1].split("@")[0] if "@" in cur[1] else j.group(2).split("@")[0]
+                facts["plt"][cur[0]] = {"name": nm, "got": int(j.group(1), 16)}
+                cur = None
+    return facts
+
+
+# --------------------------------------------------------------------------- #
+#  DWARF: functions, variables, structs, inlining  (readelf --debug-dump=info) #
+# --------------------------------------------------------------------------- #
+class Dwarf:
+    def __init__(self, exe: str):
+        self.dies = {}
+        self.funcs = []
+        self.structs = []
+        self.inl_sites = []
+        self.status = {}
+        _, out, _ = sh(["readelf", "--debug-dump=info", exe], 60)
+        stack, cur = {}, None
+        for ln in out.splitlines():
+            m = re.match(r"^\s*<(\d+)><([0-9a-f]+)>:\s*Abbrev Number:\s*(\d+)(?:\s*\((\w+)\))?", ln)
+            if m:
+                d, off = int(m.group(1)), int(m.group(2), 16)
+                if m.group(3) == "0":
+                    cur = None
+                    continue
+                cur = {"off": off, "tag": m.group(4) or "", "a": {}, "kids": [], "parent": stack.get(d - 1)}
+                self.dies[off] = cur
+                stack[d] = off
+                if cur["parent"] in self.dies:
+                    self.dies[cur["parent"]]["kids"].append(off)
+                continue
+            m = re.match(r"^\s*<[0-9a-f]+>\s+(DW_AT_\w+)\s*:\s*(.*)$", ln)
+            if m and cur is not None:
+                cur["a"][m.group(1)] = m.group(2).strip()
+        self._extract()
+
+    @staticmethod
+    def _s(v):
+        m = re.match(r"\((?:indirect|strp|line)[^)]*\):\s*(.*)$", v or "")
+        return (m.group(1) if m else (v or "")).strip()
+
+    @staticmethod
+    def _i(v, default=None):
+        m = re.match(r"\s*(0x[0-9a-fA-F]+|-?\d+)", v or "")
+        return int(m.group(1), 0) if m else default
+
+    @staticmethod
+    def _ref(v):
+        m = re.search(r"<0x([0-9a-f]+)>", v or "")
+        return int(m.group(1), 16) if m else None
+
+    def type_name(self, off, depth=0):
+        d = self.dies.get(off)
+        if d is None or depth > 8:
+            return "void"
+        t, a = d["tag"], d["a"]
+        inner = self._ref(a.get("DW_AT_type"))
+        if t == "DW_TAG_base_type":
+            return self._s(a.get("DW_AT_name"))
+        if t == "DW_TAG_pointer_type":
+            return self.type_name(inner, depth + 1) + "*" if inner else "void*"
+        if t == "DW_TAG_const_type":
+            return "const " + (self.type_name(inner, depth + 1) if inner else "void")
+        if t == "DW_TAG_volatile_type":
+            return "volatile " + (self.type_name(inner, depth + 1) if inner else "void")
+        if t in ("DW_TAG_typedef",):
+            return self._s(a.get("DW_AT_name"))
+        if t in ("DW_TAG_structure_type", "DW_TAG_union_type", "DW_TAG_class_type"):
+            return {"DW_TAG_structure_type": "struct ", "DW_TAG_union_type": "union ", "DW_TAG_class_type": "class "}[t] + (self._s(a.get("DW_AT_name")) or "<anon>")
+        if t == "DW_TAG_enumeration_type":
+            return "enum " + (self._s(a.get("DW_AT_name")) or "<anon>")
+        if t == "DW_TAG_array_type":
+            dims = ""
+            for k in d["kids"]:
+                kd = self.dies[k]
+                if kd["tag"] == "DW_TAG_subrange_type":
+                    ub = self._i(kd["a"].get("DW_AT_upper_bound"))
+                    dims += f"[{ub + 1}]" if ub is not None else "[]"
+            return self.type_name(inner, depth + 1) + dims
+        return self._s(a.get("DW_AT_name")) or t.replace("DW_TAG_", "")
+
+    def type_size(self, off, depth=0):
+        d = self.dies.get(off)
+        if d is None or depth > 8:
+            return 0
+        a = d["a"]
+        bs = self._i(a.get("DW_AT_byte_size"))
+        if bs is not None:
+            return bs
+        inner = self._ref(a.get("DW_AT_type"))
+        if d["tag"] == "DW_TAG_pointer_type":
+            return 8
+        if d["tag"] == "DW_TAG_array_type":
+            n = 1
+            for k in d["kids"]:
+                kd = self.dies[k]
+                if kd["tag"] == "DW_TAG_subrange_type":
+                    ub = self._i(kd["a"].get("DW_AT_upper_bound"))
+                    n *= (ub + 1) if ub is not None else 1
+            return n * self.type_size(inner, depth + 1)
+        return self.type_size(inner, depth + 1) if inner else 0
+
+    def _vars(self, off, out, depth=0):
+        for k in self.dies[off]["kids"]:
+            kd = self.dies[k]
+            if kd["tag"] in ("DW_TAG_variable", "DW_TAG_formal_parameter"):
+                loc = re.search(r"DW_OP_fbreg:\s*(-?\d+)", kd["a"].get("DW_AT_location", ""))
+                tr = self._ref(kd["a"].get("DW_AT_type"))
+                out.append({"name": self._s(kd["a"].get("DW_AT_name")), "fbreg": int(loc.group(1)) if loc else None,
+                            "type": self.type_name(tr) if tr else "void", "size": self.type_size(tr) if tr else 0,
+                            "param": kd["tag"] == "DW_TAG_formal_parameter", "line": self._i(kd["a"].get("DW_AT_decl_line"), 0),
+                            "toff": tr})
+            elif kd["tag"] in ("DW_TAG_lexical_block",) and depth < 6:
+                self._vars(k, out, depth + 1)
+
+    def _extract(self):
+        abstract = {}
+        for off, d in self.dies.items():
+            if d["tag"] != "DW_TAG_subprogram":
+                continue
+            a = d["a"]
+            name = self._s(a.get("DW_AT_name"))
+            lo = self._i(a.get("DW_AT_low_pc"))
+            if lo is None:
+                if "DW_AT_inline" in a and name:
+                    abstract[off] = {"name": name, "sites": 0, "line": self._i(a.get("DW_AT_decl_line"), 0)}
+                continue
+            hi = self._i(a.get("DW_AT_high_pc"), 0)
+            hi = hi if hi > lo else lo + hi
+            vs = []
+            self._vars(off, vs)
+            if not name and a.get("DW_AT_abstract_origin"):
+                o = self.dies.get(self._ref(a["DW_AT_abstract_origin"]))
+                name = self._s(o["a"].get("DW_AT_name")) if o else ""
+            self.funcs.append({"name": name, "low": lo, "high": hi, "vars": vs, "off": off,
+                               "line": self._i(a.get("DW_AT_decl_line"), 0), "external": "DW_AT_external" in a})
+        for off, d in self.dies.items():
+            if d["tag"] == "DW_TAG_inlined_subroutine":
+                ref = self._ref(d["a"].get("DW_AT_abstract_origin"))
+                if ref in abstract:
+                    abstract[ref]["sites"] += 1
+                    par, host = d["parent"], ""
+                    while par in self.dies:
+                        if self.dies[par]["tag"] == "DW_TAG_subprogram":
+                            host = self._s(self.dies[par]["a"].get("DW_AT_name"))
+                            break
+                        par = self.dies[par]["parent"]
+                    self.inl_sites.append({"callee": abstract[ref]["name"], "into": host,
+                                           "line": self._i(d["a"].get("DW_AT_call_line"), 0)})
+            elif d["tag"] in ("DW_TAG_structure_type", "DW_TAG_union_type", "DW_TAG_class_type"):
+                nm = self._s(d["a"].get("DW_AT_name"))
+                mem = []
+                for k in d["kids"]:
+                    kd = self.dies[k]
+                    if kd["tag"] == "DW_TAG_member":
+                        tr = self._ref(kd["a"].get("DW_AT_type"))
+                        mem.append({"name": self._s(kd["a"].get("DW_AT_name")), "type": self.type_name(tr) if tr else "void",
+                                    "off": self._i(kd["a"].get("DW_AT_data_member_location"), 0),
+                                    "size": self.type_size(tr) if tr else 0})
+                if mem:
+                    self.structs.append({"name": nm or "<anon>", "kind": d["tag"].split("_")[2], "size": self._i(d["a"].get("DW_AT_byte_size"), 0), "members": mem})
+        outl = {f["name"] for f in self.funcs}
+        for ab in abstract.values():
+            self.status[ab["name"]] = ({"state": "inlined", "sites": ab["sites"]} if ab["name"] not in outl and ab["sites"]
+                                       else {"state": "eliminated", "sites": 0} if ab["name"] not in outl else {"state": "out-of-line+inlined", "sites": ab["sites"]})
+        for f in self.funcs:
+            self.status.setdefault(f["name"], {"state": "out-of-line", "sites": 0})
+
+    def func_at(self, pc):
+        for f in self.funcs:
+            if f["low"] <= pc < f["high"]:
+                return f
+        return None
+
+
+class BinInfo:
+    def __init__(self, exe: Path, work: Path):
+        self.exe = str(exe)
+        self.facts = elf_facts(self.exe, work)
+        self.sym = SymTab(self.exe)
+        self.dwarf = Dwarf(self.exe)
+        self.pie = self.facts["type"] == "DYN"
+        txt = next((s for s in self.facts["sections"] if s["name"] == ".text"), None)
+        if self.dwarf.funcs:
+            self.user = sorted((f["low"], f["high"], f["name"]) for f in self.dwarf.funcs)
+        elif txt:
+            self.user = [(txt["addr"], txt["addr"] + txt["size"], ".text")]
+        else:
+            self.user = []
+        self.user_lo = [u[0] for u in self.user]
+
+    def user_func(self, v):
+        i = bisect.bisect_right(self.user_lo, v) - 1
+        if i >= 0 and v < self.user[i][1]:
+            return self.user[i][2]
+        return None
+
+
+# =========================================================================== #
+#  2. EXECUTION ENGINE (ptrace via ctypes)                                    #
+# =========================================================================== #
+libc = ctypes.CDLL(None, use_errno=True)
+libc.ptrace.restype = ctypes.c_long
+libc.ptrace.argtypes = [ctypes.c_long, ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p]
+PT_CONT, PT_KILL, PT_STEP, PT_GETREGS, PT_SETREGS, PT_SETOPTIONS, PT_SYSCALL, PT_GETSIGINFO = 7, 8, 9, 12, 13, 0x4200, 24, 0x4202
+RN = "r15 r14 r13 r12 rbp rbx r11 r10 r9 r8 rax rcx rdx rsi rdi orig_rax rip cs eflags rsp ss fs_base gs_base ds es fs gs".split()
+RI = {n: i for i, n in enumerate(RN)}
+RAX, RIP, RSP, RBP, RDI, RSI, RDX, R10, R8, R9, RCX, FSB, GSB = (RI[x] for x in "rax rip rsp rbp rdi rsi rdx r10 r8 r9 rcx fs_base gs_base".split())
+GPR = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"]
+
+
+def pt(req, pid, addr=0, data=0):
+    return libc.ptrace(req, pid, ctypes.c_void_p(addr), ctypes.c_void_p(data))
+
+
+def getregs(pid):
+    a = (ctypes.c_ulonglong * 27)()
+    pt(PT_GETREGS, pid, 0, ctypes.addressof(a))
+    return list(a)
+
+
+def setregs(pid, R):
+    a = (ctypes.c_ulonglong * 27)(*R)
+    pt(PT_SETREGS, pid, 0, ctypes.addressof(a))
+
+
+ERRNO = {1: "EPERM", 2: "ENOENT", 4: "EINTR", 9: "EBADF", 11: "EAGAIN", 12: "ENOMEM", 13: "EACCES", 14: "EFAULT", 17: "EEXIST",
+         20: "ENOTDIR", 21: "EISDIR", 22: "EINVAL", 24: "EMFILE", 32: "EPIPE", 38: "ENOSYS", 111: "ECONNREFUSED"}
+# nr -> (name, arg kinds)  F fd  S cstring  B buffer  I int  X hex/ptr  O open flags  P prot  M mmap flags  N signal
+SYS = {0: ("read", "FBI"), 1: ("write", "FBI"), 2: ("open", "SOX"), 3: ("close", "F"), 4: ("stat", "SX"), 5: ("fstat", "FX"), 6: ("lstat", "SX"),
+       7: ("poll", "XII"), 8: ("lseek", "FII"), 9: ("mmap", "XIPMFX"), 10: ("mprotect", "XIP"), 11: ("munmap", "XI"), 12: ("brk", "X"),
+       13: ("rt_sigaction", "NXX"), 14: ("rt_sigprocmask", "IXX"), 16: ("ioctl", "FXX"), 17: ("pread64", "FBII"), 18: ("pwrite64", "FBII"),
+       20: ("writev", "FXI"), 21: ("access", "SI"), 22: ("pipe", "X"), 24: ("sched_yield", ""), 25: ("mremap", "XIIIX"), 28: ("madvise", "XII"),
+       32: ("dup", "F"), 33: ("dup2", "FI"), 35: ("nanosleep", "XX"), 39: ("getpid", ""), 41: ("socket", "III"), 42: ("connect", "FXI"),
+       43: ("accept", "FXX"), 44: ("sendto", "FBIIXI"), 45: ("recvfrom", "FBIIXX"), 48: ("shutdown", "FI"), 49: ("bind", "FXI"), 50: ("listen", "FI"),
+       54: ("setsockopt", "FIIXI"), 56: ("clone", "XXXXX"), 57: ("fork", ""), 58: ("vfork", ""), 59: ("execve", "SXX"), 60: ("exit", "I"),
+       61: ("wait4", "IXIX"), 62: ("kill", "IN"), 63: ("uname", "X"), 72: ("fcntl", "FII"), 79: ("getcwd", "XI"), 80: ("chdir", "S"),
+       82: ("rename", "SS"), 83: ("mkdir", "SI"), 87: ("unlink", "S"), 89: ("readlink", "SXI"), 96: ("gettimeofday", "XX"), 102: ("getuid", ""),
+       104: ("getgid", ""), 107: ("geteuid", ""), 108: ("getegid", ""), 110: ("getppid", ""), 158: ("arch_prctl", "IX"), 186: ("gettid", ""),
+       202: ("futex", "XIIXXI"), 218: ("set_tid_address", "X"), 228: ("clock_gettime", "IX"), 231: ("exit_group", "I"), 257: ("openat", "ISOX"),
+       262: ("newfstatat", "ISXI"), 273: ("set_robust_list", "XI"), 302: ("prlimit64", "IIXX"), 318: ("getrandom", "XII"), 332: ("statx", "ISIIX"),
+       334: ("rseq", "XIII"), 435: ("clone3", "XI")}
+OFL = [(1, "O_WRONLY"), (2, "O_RDWR"), (0o100, "O_CREAT"), (0o200, "O_EXCL"), (0o1000, "O_TRUNC"), (0o2000, "O_APPEND"), (0o4000, "O_NONBLOCK"), (0o2000000, "O_CLOEXEC")]
+PRF = [(1, "R"), (2, "W"), (4, "X")]
+MFL = [(1, "SHARED"), (2, "PRIVATE"), (0x10, "FIXED"), (0x20, "ANON"), (0x100000, "STACK")]
+
+
+def flags_str(v, table, zero="0"):
+    out = [n for b, n in table if v & b]
+    return "|".join(out) if out else zero
+
+
+# --- register / operand tables --------------------------------------------- #
+REGMAP = {}
+for _b in "abcd":
+    REGMAP.update({f"r{_b}x": (f"r{_b}x", 8), f"e{_b}x": (f"r{_b}x", 4), f"{_b}x": (f"r{_b}x", 2), f"{_b}l": (f"r{_b}x", 1), f"{_b}h": (f"r{_b}x", 1)})
+for _r in ("si", "di", "bp", "sp"):
+    REGMAP.update({f"r{_r}": (f"r{_r}", 8), f"e{_r}": (f"r{_r}", 4), _r: (f"r{_r}", 2), f"{_r}l": (f"r{_r}", 1)})
+for _n in range(8, 16):
+    REGMAP.update({f"r{_n}": (f"r{_n}", 8), f"r{_n}d": (f"r{_n}", 4), f"r{_n}w": (f"r{_n}", 2), f"r{_n}b": (f"r{_n}", 1), f"r{_n}l": (f"r{_n}", 1)})
+for _n in range(32):
+    REGMAP.update({f"xmm{_n}": (f"xmm{_n}", 16), f"ymm{_n}": (f"xmm{_n}", 32), f"zmm{_n}": (f"xmm{_n}", 64)})
+REGMAP["rip"] = ("rip", 8)
+PSIZE = {"BYTE": 1, "WORD": 2, "DWORD": 4, "QWORD": 8, "XMMWORD": 16, "YMMWORD": 32, "ZMMWORD": 64, "TBYTE": 10, "OWORD": 16, "FWORD": 6}
+RE_MEM = re.compile(r"^(?:(\w+)\s+PTR\s+)?(?:([a-z]s):)?(?:\[(.*)\]|(-?0x[0-9a-f]+))$")
+NONE_MN = {"nop", "endbr64", "hlt", "ud2", "pause", "cpuid", "syscall", "int3", "xgetbv", "rdtsc", "lfence", "mfence", "sfence", "cdq", "cdqe", "cqo",
+           "cwde", "cld", "std", "vzeroupper", "vzeroall", "clc", "stc", "sahf", "lahf", "fwait", "emms", "ud1", "rdtscp"}
+CC_OP = {"e": "==", "z": "==", "ne": "!=", "nz": "!=", "l": "<", "nge": "<", "le": "<=", "ng": "<=", "g": ">", "nle": ">", "ge": ">=", "nl": ">=",
+         "b": "<u", "c": "<u", "nae": "<u", "be": "<=u", "na": "<=u", "a": ">u", "nbe": ">u", "ae": ">=u", "nb": ">=u", "nc": ">=u", "s": "<0", "ns": ">=0"}
+INVERT = {"==": "!=", "!=": "==", "<": ">=", ">=": "<", "<=": ">", ">": "<=", "<u": ">=u", ">=u": "<u", "<=u": ">u", ">u": "<=u", "<0": ">=0", ">=0": "<0"}
+
+
+def split_ops(s):
+    out, d, cur = [], 0, ""
+    for ch in s:
+        if ch == "[":
+            d += 1
+        elif ch == "]":
+            d -= 1
+        if ch == "," and d == 0:
+            out.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        out.append(cur.strip())
+    return out
+
+
+def parse_operand(o, mems):
+    o = o.strip()
+    m = RE_MEM.match(o)
+    if m and (m.group(3) is not None or (m.group(4) is not None and m.group(2))):
+        size = PSIZE.get((m.group(1) or "").upper(), 8)
+        terms, disp = [], 0
+        if m.group(3) is not None:
+            for sg, tok in re.findall(r"([+-]?)\s*([^+-]+)", m.group(3)):
+                tok = tok.strip()
+                sign = -1 if sg == "-" else 1
+                if "*" in tok:
+                    r, sc = tok.split("*")
+                    terms.append((REGMAP.get(r.strip(), (r.strip(), 8))[0], int(sc, 0) * sign))
+                elif re.match(r"^(0x[0-9a-f]+|\d+)$", tok):
+                    disp += sign * int(tok, 0)
+                else:
+                    terms.append((REGMAP.get(tok, (tok, 8))[0], sign))
+        else:
+            disp = int(m.group(4), 0)
+        mems.append({"size": size, "seg": m.group(2) or "", "terms": terms, "disp": disp})
+        return ("m", len(mems) - 1)
+    if o in REGMAP:
+        return ("r",) + REGMAP[o]
+    if re.match(r"^-?(0x)?[0-9a-f]+$", o):
+        try:
+            return ("i", int(o, 16))
+        except ValueError:
+            pass
+    return ("x", o)
+
+
+class Plan:
+    __slots__ = ("asm", "mn", "cls", "rep", "ops", "mems", "modes", "ln", "rr", "rw", "raw", "cc")
+
+
+def make_plan(asm, raw, ln):
+    s = asm.split("#")[0].strip()
+    toks = s.split(None, 1)
+    mn, rest, rep = (toks[0] if toks else "nop"), (toks[1] if len(toks) > 1 else ""), False
+    while rest and (mn in ("rep", "repz", "repe", "repnz", "repne", "lock", "bnd", "notrack", "cs", "ds", "es", "ss", "fs", "gs", "data16", "addr32") or mn.startswith("rex")):
+        rep = rep or mn.startswith("rep")
+        t = rest.split(None, 1)
+        mn, rest = t[0], (t[1] if len(t) > 1 else "")
+    rest = re.sub(r"\s*<[^>]*>\s*$", "", rest)
+    mems = []
+    ops = [parse_operand(o, mems) for o in split_ops(rest)]
+    n = len(ops)
+    if mn == "lea": cls = "lea"
+    elif mn in ("push", "pop", "call", "leave", "jmp", "xchg"): cls = mn
+    elif mn in ("ret", "retn"): cls = "ret"
+    elif mn.startswith("j"): cls = "jcc"
+    elif mn in ("movs", "stos", "lods", "scas", "cmps"): cls = "str"
+    elif mn.startswith("cmov"): cls = "cmov"
+    elif mn.startswith("set"): cls = "set"
+    elif mn in ("cmp", "test", "bt", "ptest", "vptest") or mn.startswith(("ucomis", "comis", "vucomis", "vcomis")): cls = "cmp"
+    elif mn.startswith(("mov", "vmov", "cvt", "vcvt", "lddqu", "vbroadcast", "pbroadcast", "vpbroadcast", "pmovmsk", "vpmovmsk")): cls = "mov"
+    elif mn in ("inc", "dec", "neg", "not", "bswap"): cls = "unary"
+    elif mn in ("mul", "div", "idiv") or (mn == "imul" and n == 1): cls = "muldiv"
+    elif mn in NONE_MN or mn.startswith(("nop", "prefetch", "endbr")): cls = "none"
+    elif n >= 2: cls = "alu"
+    else: cls = "other"
+    modes = {}
+    vex = mn.startswith("v")
+    for i, o in enumerate(ops):
+        if o[0] != "m" or cls in ("lea", "none"):
+            continue
+        if cls == "mov": m = "w" if i == 0 else "r"
+        elif cls in ("alu", "xchg", "unary"): m = ("w" if vex else "rw") if i == 0 else ("rw" if cls == "xchg" else "r")
+        elif cls == "set" or cls == "pop": m = "w"
+        elif cls == "str":
+            m = {"movs": {0: "w", 1: "r"}, "stos": {0: "w"}, "lods": {1: "r"}, "scas": {1: "r"}, "cmps": {0: "r", 1: "r"}}[mn].get(i, "")
+        else: m = "r"
+        if m:
+            modes[o[1]] = m
+    rr, rw = set(), set()
+    for m in mems:
+        rr.update(t[0] for t in m["terms"])
+    for i, o in enumerate(ops):
+        if o[0] != "r":
+            continue
+        dest = i == 0 and cls in ("mov", "alu", "unary", "pop", "xchg", "set", "cmov", "lea")
+        if dest:
+            rw.add(o[1])
+        if not (dest and (cls in ("mov", "pop", "set", "lea") or (cls == "alu" and vex))):
+            rr.add(o[1])
+    if cls == "muldiv":
+        rr.add("rax"); rw.update(("rax", "rdx"))
+    for x in ("rsp", "rip"):
+        rr.discard(x); rw.discard(x)
+    p = Plan()
+    p.asm, p.mn, p.cls, p.rep, p.ops, p.mems, p.modes, p.ln, p.raw = asm.split("#")[0].strip(), mn, cls, rep, ops, mems, modes, ln, raw
+    p.rr, p.rw = tuple(rr), tuple(rw)
+    p.cc = CC_OP.get(mn[1:]) if cls == "jcc" else None
+    return p
+
+
+class Maps:
+    """/proc/pid/maps tracker + per-object symbol lookup."""
+
+    def __init__(self, pid, info: BinInfo):
+        self.pid, self.info, self.reg, self.starts, self.base, self.syms, self.cache = pid, info, [], [], {}, {}, {}
+        self.lines = []
+        self.syms[info.exe] = info.sym
+
+    def refresh(self):
+        try:
+            self.lines = Path(f"/proc/{self.pid}/maps").read_text().splitlines()
+        except OSError:
+            return
+        reg = []
+        for ln in self.lines:
+            m = re.match(r"([0-9a-f]+)-([0-9a-f]+)\s+(\S+)\s+([0-9a-f]+)\s+\S+\s+\d+\s*(.*)$", ln)
+            if m:
+                reg.append((int(m.group(1), 16), int(m.group(2), 16), m.group(3), int(m.group(4), 16), m.group(5).strip()))
+        reg.sort()
+        self.reg, self.starts = reg, [r[0] for r in reg]
+        for s, e, pm, off, path in reg:
+            if path.startswith("/") and off == 0 and path not in self.base:
+                self.base[path] = 0 if (path == self.info.exe and not self.info.pie) else s
+        self.cache.clear()
+
+    def find(self, a):
+        i = bisect.bisect_right(self.starts, a) - 1
+        if i >= 0 and a < self.reg[i][1]:
+            return self.reg[i]
+        return None
+
+    def vaddr(self, a):
+        r = self.find(a)
+        if r and r[4].startswith("/") and r[4] in self.base:
+            return r[4], a - self.base[r[4]]
+        return None
+
+    def sym(self, a):
+        if a in self.cache:
+            return self.cache[a]
+        res = None
+        pv = self.vaddr(a)
+        if pv:
+            path, v = pv
+            if path == self.info.exe:
+                stub = self.info.facts["plt"]
+                for sa, d in stub.items():
+                    if sa <= v < sa + 16:
+                        res = (d["name"] + "@plt", v - sa, os.path.basename(path))
+                        break
+            if res is None:
+                if path not in self.syms:
+                    self.syms[path] = SymTab(path)
+                s = self.syms[path].lookup(v)
+                res = (s[0], s[1], os.path.basename(path)) if s else (f"{os.path.basename(path)}+{v:#x}", -1, os.path.basename(path))
+        else:
+            r = self.find(a)
+            res = (f"[{r[4].strip('[]') or 'anon'}]" if r else "??", -1, "")
+        self.cache[a] = res
+        return res
+
+    def snapshot(self):
+        out = []
+        for s, e, pm, off, path in self.reg:
+            out.append([s, e, pm, os.path.basename(path) if path.startswith("/") else path or "anon"])
+        return out
+
+
+class Disasm:
+    def __init__(self, maps: Maps):
+        self.maps, self.cache, self.bad = maps, {}, set()
+
+    def get(self, rip):
+        p = self.cache.get(rip)
+        if p is None and rip not in self.bad:
+            self.fill(rip)
+            p = self.cache.get(rip)
+            if p is None:
+                self.bad.add(rip)
+        return p
+
+    def fill(self, rip):
+        pv = self.maps.vaddr(rip)
+        if not pv:
+            return
+        path, v = pv
+        base = rip - v
+        rc, out, _ = sh(["objdump", "-d", "-M", "intel", "-w", f"--start-address={v:#x}", f"--stop-address={v + 640:#x}", path], 20)
+        for ln in out.splitlines():
+            parts = ln.split("\t")
+            if len(parts) < 3 or ":" not in parts[0]:
+                continue
+            try:
+                a = int(parts[0].strip().rstrip(":"), 16) + base
+            except ValueError:
+                continue
+            raw = parts[1].strip()
+            if a not in self.cache:
+                self.cache[a] = make_plan(parts[2].strip(), raw, len(raw.split()))
+
+
+def tmerge(ts):
+    n = max((len(t) for t in ts), default=0)
+    if not n:
+        return ()
+    out = []
+    for i in range(n):
+        v = None
+        for t in ts:
+            if i < len(t) and t[i] is not None:
+                v = t[i]
+                break
+        out.append(v)
+    return tuple(out) if any(x is not None for x in out) else ()
+
+
+def fmt_sym(e):
+    s, m, a = e
+    if not s:
+        return hx(a & MASK) if a >= 0 else str(a)
+    t = s if m == 1 else f"{s}*{m}"
+    return t + (f"+{a}" if a > 0 else f"{a}" if a < 0 else "")
+
+
+ALLOCS = {"malloc", "free", "calloc", "realloc"}
+FMT_SINK = {"printf": 0, "fprintf": 1, "sprintf": 1, "snprintf": 2, "dprintf": 1, "syslog": 1}
+EXEC_SINK = {"system": 0, "popen": 0, "execl": 0, "execlp": 0, "execv": 0, "execvp": 0}
+SIZE_SINK = {"memcpy": 2, "memmove": 2, "strncpy": 2, "memset": 2, "malloc": 0, "calloc": 0, "realloc": 1, "read": 2, "fread": 1, "alloca": 0}
+COPY_SINK = {"strcpy", "strcat", "gets", "sprintf", "vsprintf", "stpcpy"}
+ARGREG = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
+SEV = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+
+
+class Tracer:
+    def __init__(self, info: BinInfo, argv, env, stdin_data: bytes, max_steps, timeout, work: Path, tag="run"):
+        self.info, self.argv, self.env, self.stdin = info, argv, env, stdin_data
+        self.max_steps, self.deadline, self.work, self.tag = max_steps, time.time() + timeout, work, tag
+        # recording
+        self.steps = 0
+        self.rips = array("Q")
+        self.mem = []              # (step, R/W, addr, size, value, rip)
+        self.events = []           # condensed timeline
+        self.keyframes = []
+        self.syscalls = []
+        self.findings, self.fkeys = [], set()
+        self.maps_snaps = []
+        self.calls = Counter()     # (caller, callee) -> n
+        self.fn_steps = Counter()
+        self.fn_obj = {}
+        self.plt_res = {}
+        self.succ = Counter()      # user (rip,next) -> n
+        self.hits = Counter()      # user rip -> n
+        self.defuse = Counter()    # (def_rip,use_rip,via,tainted)
+        self.var_access = Counter()  # (rip,var,kind)
+        self.heap_access = Counter()  # (rip,alloc_id,kind)
+        self.ranges = defaultdict(list)
+        self.sym_events, self.constraints, self.flows, self.tainted_branch = [], [], [], {}
+        self.tainted_args = defaultdict(set)
+        self.indirect = defaultdict(set)
+        self.exc = []
+        self.sources = []          # label id -> (tag, offset)
+        self.fds = {0: {"kind": "stdin", "path": "stdin"}, 1: {"kind": "stdout", "path": "stdout"}, 2: {"kind": "stderr", "path": "stderr"}}
+        self.fdnodes = {k: dict(v, reads=0, writes=0, bytes=0) for k, v in self.fds.items()}
+        self.fdpos = Counter()
+        self.mmaps, self.threads = [], []
+        self.exit = {"code": None, "signal": None, "truncated": False}
+        self.output = ""
+        # state
+        self.rt, self.mt, self.rs, self.ms = {}, {}, {}, {}
+        self.flag_t, self.last_cmp = (), None
+        self.frames, self.slots = [], {}
+        self.allocs, self.blocks, self.bstarts = [], {}, []
+        self._symseen, self._fvc, self.last_regs = set(), {}, [0] * 27
+        self.aid = 0
+        self.pending_alloc = []
+        self.alloc_depth = 0
+        self.lastdef, self.lastdef_mem = {}, {}
+        self.pending_plt = {}
+        self.cur_span = None
+        self.n_user_ev = 0
+        self.sys_pending = None
+        self.main_regs = None
+        self.pid = None
+
+    # ---------------------------------------------------------------- helpers
+    def rd(self, a, n):
+        try:
+            return os.pread(self.memfd, n, a)
+        except (OSError, OverflowError, ValueError):
+            return None
+
+    def rdi(self, a, n):
+        b = self.rd(a, n)
+        return int.from_bytes(b, "little") if b else None
+
+    def cstr(self, a, n=160):
+        b = self.rd(a, n) or b""
+        return b.split(b"\0")[0].decode("latin1")
+
+    def finding(self, sev, kind, title, detail, rip, labels=(), extra=None):
+        key = (kind, rip, title[:40])
+        if key in self.fkeys:
+            return
+        self.fkeys.add(key)
+        w = self.witness(labels)
+        if extra:
+            w.update(extra)
+        self.findings.append({"sev": sev, "kind": kind, "title": title, "detail": detail, "step": self.steps, "rip": rip, "witness": w})
+
+    def witness(self, labels):
+        by = defaultdict(set)
+        for l in labels:
+            if l is not None and l < len(self.sources):
+                tag, off = self.sources[l]
+                by[tag].add(off)
+        srcs = {}
+        for tag, offs in by.items():
+            offs, rng = sorted(offs), []
+            for o in offs:
+                if rng and o == rng[-1][1] + 1:
+                    rng[-1][1] = o
+                else:
+                    rng.append([o, o])
+            srcs[tag] = ",".join(f"{a}" if a == b else f"{a}-{b}" for a, b in rng[:8])
+        return {"input_bytes": srcs}
+
+    def labels_at(self, a, n):
+        out = set()
+        for i in range(n):
+            v = self.mt.get(a + i)
+            if v is not None:
+                out.add(v)
+        return out
+
+    def symof(self, rip):
+        return self.maps.sym(rip)
+
+    def snapshot_maps(self, why):
+        self.maps.refresh()
+        if len(self.maps_snaps) < 60:
+            self.maps_snaps.append({"step": self.steps, "why": why, "maps": self.maps.snapshot()})
+
+    # ---------------------------------------------------------------- process control
+    def spawn(self):
+        sin = self.work / f"{self.tag}.stdin"
+        sin.write_bytes(self.stdin)
+        self.out_path, self.err_path = self.work / f"{self.tag}.stdout", self.work / f"{self.tag}.stderr"
+        pid = os.fork()
+        if pid == 0:
+            try:
+                libc.personality(0x0040000)
+                os.dup2(os.open(str(sin), os.O_RDONLY), 0)
+                os.dup2(os.open(str(self.out_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644), 1)
+                os.dup2(os.open(str(self.err_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644), 2)
+                libc.ptrace(0, 0, None, None)
+                os.execve(self.info.exe, [self.info.exe] + self.argv, self.env)
+            finally:
+                os._exit(127)
+        os.waitpid(pid, 0)
+        pt(PT_SETOPTIONS, pid, 0, 0x100001)   # EXITKILL | TRACESYSGOOD
+        self.pid = pid
+        self.memfd = os.open(f"/proc/{pid}/mem", os.O_RDWR)
+        self.maps = Maps(pid, self.info)
+        self.dis = Disasm(self.maps)
+        self.maps.refresh()
+
+    def finish(self, st):
+        if os.WIFEXITED(st):
+            self.exit["code"] = os.WEXITSTATUS(st)
+        elif os.WIFSIGNALED(st):
+            self.exit["signal"] = signal.Signals(os.WTERMSIG(st)).name
+        self.close_span()
+        for p in (self.out_path, self.err_path):
+            pass
+        self.output = (self.out_path.read_text(errors="replace") if self.out_path.exists() else "")[:4000]
+        self.errout = (self.err_path.read_text(errors="replace") if self.err_path.exists() else "")[:2000]
+        self.pid = None
+
+    def phase1(self):
+        """Fast syscall-only run up to main(): loader, libc init."""
+        main = self.info.sym.by_name.get("main")
+        if main is None:
+            return True
+        base = self.maps.base.get(self.info.exe, 0) if self.info.pie else 0
+        main += base
+        orig = self.rd(main, 1)
+        os.pwrite(self.memfd, b"\xcc", main)
+        sig, insys, cur = 0, False, None
+        while True:
+            pt(PT_SYSCALL, self.pid, 0, sig)
+            sig = 0
+            _, st = os.waitpid(self.pid, 0)
+            if os.WIFEXITED(st) or os.WIFSIGNALED(st):
+                self.finish(st)
+                return False
+            s = os.WSTOPSIG(st)
+            if s == (signal.SIGTRAP | 0x80):
+                R = getregs(self.pid)
+                if not insys:
+                    cur = self.sys_begin(R, -1)
+                    insys = True
+                else:
+                    insys = False
+                    if cur:
+                        self.sys_end(cur, R[RAX])
+            elif s == signal.SIGTRAP:
+                R = getregs(self.pid)
+                if R[RIP] - 1 == main:
+                    os.pwrite(self.memfd, orig, main)
+                    R[RIP] -= 1
+                    setregs(self.pid, R)
+                    return True
+            else:
+                sig = s
+
+    # ---------------------------------------------------------------- syscalls
+    def sys_begin(self, R, step):
+        nr = R[RI["orig_rax"]] if step < 0 else R[RAX]
+        name, kinds = SYS.get(nr, (f"syscall_{nr}", ""))
+        args = [R[RDI], R[RSI], R[RDX], R[R10], R[R8], R[R9]]
+        rec = {"nr": nr, "name": name, "kinds": kinds, "args": args, "step": step, "rip": R[RIP], "fn": ""}
+        # taint sinks seen at entry
+        if name in ("write", "send", "sendto", "pwrite64") and args[2] < 1 << 16:
+            labs = self.labels_at(args[1], min(args[2], 4096))
+            if labs:
+                fd = self.fds.get(args[0], {})
+                self.flows.append({"src": self.witness(labs)["input_bytes"], "sink": f"{name}(fd {args[0]}:{fd.get('path', '?')})", "step": self.steps})
+                if fd.get("kind") in ("socket", "file"):
+                    self.finding("MEDIUM", "taint-sink", f"input reaches {name}() on {fd.get('kind')} {fd.get('path', '')}", "attacker-influenced bytes leave the process", R[RIP], labs)
+        if name in ("open", "openat", "unlink", "rename", "execve", "mkdir", "chdir", "access"):
+            ptr = args[1] if name == "openat" else args[0]
+            labs = self.labels_at(ptr, 64)
+            if labs:
+                crit = name == "execve"
+                self.finding("CRITICAL" if crit else "HIGH", "taint-sink", f"input reaches {name}() path: \"{self.cstr(ptr, 80)}\"",
+                             "tainted file name / program" , R[RIP], labs)
+        rec["fn"] = self.symof(R[RIP])[0] if self.pid else ""
+        return rec
+
+    def fmt_arg(self, k, v, rec, res):
+        if k == "F":
+            f = self.fds.get(v)
+            return f"fd {v}" + (f"<{f['path']}>" if f and f["kind"] in ("file", "socket") else "")
+        if k == "S":
+            return '"' + self.cstr(v, 96).encode("unicode_escape").decode() + '"' if v else "NULL"
+        if k == "B":
+            n = rec["args"][2]
+            if rec["name"] in ("read", "recvfrom", "pread64") and res is not None and res >= 0 and res < 1 << 40:
+                n = res
+            data = self.rd(v, min(n, 24)) if n else b""
+            return "buf=" + (repr(data.decode("latin1"))[:40] if data else "NULL") + ("…" if n > 24 else "")
+        if k == "O":
+            return flags_str(v & 0xffffffff, OFL, "O_RDONLY")
+        if k == "P":
+            return flags_str(v, PRF, "NONE")
+        if k == "M":
+            return flags_str(v, MFL)
+        if k == "N":
+            try:
+                return signal.Signals(v).name
+            except ValueError:
+                return str(v)
+        if k == "I":
+            return str(v - (1 << 64) if v >= 1 << 63 else v)
+        return hx(v) if v else "0"
+
+    def sys_end(self, rec, res):
+        name, kinds, args = rec["name"], rec["kinds"], rec["args"]
+        sres = None if res is None else (res - (1 << 64) if res >= 1 << 63 else res)
+        argt = ", ".join(self.fmt_arg(k, args[i], rec, sres) for i, k in enumerate(kinds))
+        if sres is None:
+            rtxt = "∅"
+        elif -4096 < sres < 0:
+            rtxt = f"-{ERRNO.get(-sres, 'E' + str(-sres))}"
+        else:
+            rtxt = str(sres) if name not in ("mmap", "brk", "mremap") else hx(sres)
+        rec["text"], rec["res"] = f"{name}({argt}) → {rtxt}", sres
+        # fd table & taint sources
+        ok = sres is not None and sres >= 0
+        if name in ("open", "openat") and ok:
+            path = self.cstr(args[1] if name == "openat" else args[0], 200)
+            self.fds[sres] = {"kind": "file", "path": path}
+            self.fdnodes.setdefault(sres, {"kind": "file", "path": path, "reads": 0, "writes": 0, "bytes": 0})
+            self.fdnodes[sres].update(kind="file", path=path)
+            rec["node"] = path
+        elif name == "socket" and ok:
+            dom = {1: "UNIX", 2: "INET", 10: "INET6"}.get(args[0], str(args[0]))
+            self.fds[sres] = {"kind": "socket", "path": f"{dom}/{'STREAM' if args[1] & 15 == 1 else 'DGRAM' if args[1] & 15 == 2 else args[1]}"}
+            self.fdnodes[sres] = dict(self.fds[sres], reads=0, writes=0, bytes=0)
+        elif name == "accept" and ok:
+            self.fds[sres] = {"kind": "socket", "path": "accepted"}
+            self.fdnodes[sres] = dict(self.fds[sres], reads=0, writes=0, bytes=0)
+        elif name in ("dup", "dup2") and ok and args[0] in self.fds:
+            self.fds[sres] = self.fds[args[0]]
+        elif name == "close" and ok:
+            self.fds.pop(args[0], None)
+        elif name == "connect":
+            sa = self.rd(args[1], 16) or b""
+            if len(sa) >= 8 and sa[0] == 2:
+                self.fds.setdefault(args[0], {"kind": "socket", "path": ""})["path"] = f"{'.'.join(str(b) for b in sa[4:8])}:{int.from_bytes(sa[2:4], 'big')}"
+                self.fdnodes[args[0]] = dict(self.fds[args[0]], reads=0, writes=0, bytes=0)
+                rec["text"] += f"  [{self.fds[args[0]]['path']}]"
+        if name in ("clone", "fork", "vfork", "clone3") and ok:
+            self.threads.append({"kind": name, "child": sres, "step": self.steps})
+        fdi = self.fds.get(args[0], {})
+        sysfile = fdi.get("kind") == "file" and fdi.get("path", "").startswith(("/lib", "/usr", "/etc/ld", "/proc", "/sys", "/etc/locale"))
+        if name in ("read", "pread64", "recvfrom") and ok and sres > 0 and rec["step"] >= 0 and not sysfile:
+            fd = args[0]
+            fdn = self.fdnodes.setdefault(fd, {"kind": "file", "path": f"fd{fd}", "reads": 0, "writes": 0, "bytes": 0})
+            fdn["reads"] += 1
+            fdn["bytes"] += sres
+            tag = "stdin" if fd == 0 else f"fd{fd}"
+            for i in range(min(sres, 65536)):
+                self.sources.append((tag, self.fdpos[fd] + i))
+                lid = len(self.sources) - 1
+                self.mt[args[1] + i] = lid
+                self.ms[args[1] + i] = (f"{'in' if fd == 0 else tag}[{self.fdpos[fd] + i}]", 1, 0)
+            self.fdpos[fd] += sres
+        if name in ("write", "sendto", "pwrite64") and ok:
+            fdn = self.fdnodes.setdefault(args[0], {"kind": "file", "path": f"fd{args[0]}", "reads": 0, "writes": 0, "bytes": 0})
+            fdn["writes"] += 1
+            fdn["bytes"] += sres
+        if name in ("mmap", "munmap", "mprotect", "brk", "mremap"):
+            if name == "mmap" and ok:
+                self.mmaps.append({"addr": sres & MASK, "len": args[1], "prot": self.fmt_arg("P", args[2], rec, 0), "flags": self.fmt_arg("M", args[3], rec, 0), "fd": args[4] if args[4] < 1 << 63 else -1, "step": self.steps})
+            if self.pid:
+                self.snapshot_maps(name)
+        self.syscalls.append(rec)
+        self.close_span()
+        self.events.append({"t": "y", "s": rec["step"], "text": rec["text"], "name": name})
+
+    # ---------------------------------------------------------------- main loop
+    def run(self):
+        self.spawn()
+        self.snapshot_maps("exec")
+        if not self.phase1():
+            return self
+        self.snapshot_maps("main")
+        R = getregs(self.pid)
+        self.main_regs = list(R)
+        self.on_main(R)
+        self.loop(R)
+        return self
+
+    def on_main(self, R):
+        argc, argvp = R[RDI], R[RSI]
+        self.rs["rdi"] = ("argc", 1, 0)
+        self.frames.append({"fn": "main", "ret": None, "cfa": R[RSP] + 8, "slot": R[RSP], "user": True})
+        self.slots[R[RSP]] = "main"
+        self.argv_seen = []
+        for i in range(min(argc, 16)):
+            p = self.rdi(argvp + 8 * i, 8)
+            if not p:
+                break
+            s = self.cstr(p, 200)
+            self.argv_seen.append(s)
+            if i >= 1:
+                for j in range(len(s)):
+                    self.sources.append((f"argv[{i}]", j))
+                    self.mt[p + j] = len(self.sources) - 1
+        ep = argvp + 8 * (argc + 1)
+        self.env_seen = []
+        for i in range(64):
+            p = self.rdi(ep + 8 * i, 8)
+            if not p:
+                break
+            self.env_seen.append(self.cstr(p, 120))
+
+    def close_span(self):
+        sp = self.cur_span
+        if sp and not sp.get("closed"):
+            sp["closed"] = True
+            sp["chg"] = {n: [sp["r0"][i], self.last_regs[i]] for n, i in RI.items() if n in GPR + ["rsp"] and sp["r0"][i] != self.last_regs[i]}
+            sp.pop("r0", None)
+        self.cur_span = None
+
+    def loop(self, R):
+        pid, info = self.pid, self.info
+        pend_sig = 0
+        self.last_regs = R
+        sysrec = None
+        while self.steps < self.max_steps:
+            if time.time() > self.deadline:
+                self.exit["truncated"] = "timeout"
+                break
+            rip = R[RIP]
+            pl = self.dis.get(rip)
+            if rip not in self.maps.cache and self.maps.find(rip) is None:
+                self.maps.refresh()
+                pl = self.dis.get(rip)
+            user = info.user_func(rip - (self.maps.base.get(info.exe, 0) if info.pie else 0)) is not None and self.maps.find(rip) is not None and self.maps.find(rip)[4] == info.exe
+            eas, rvals = [], {}
+            if pl is not None and pl.mems:
+                for m in pl.mems:
+                    a = m["disp"]
+                    for r, sc in m["terms"]:
+                        a += (rip + pl.ln) if r == "rip" else (R[RI[r]] * sc if r in RI else 0)
+                    if m["seg"] == "fs": a += R[FSB]
+                    elif m["seg"] == "gs": a += R[GSB]
+                    eas.append(a & MASK)
+                for idx, mode in pl.modes.items():
+                    if "r" in mode:
+                        rvals[idx] = self.rdi(eas[idx], min(pl.mems[idx]["size"], 16))
+            sp_before = R[RSP]
+            if pl is not None and pl.mn == "syscall":
+                sysrec = self.sys_begin(R, self.steps)
+            if pl is not None and pl.cls in ("ret", "pop"):
+                stk = self.rdi(sp_before, 8)
+            if pl is not None and pl.cls == "ret":
+                self.check_ret(sp_before, stk, rip)
+            pt(PT_STEP, pid, 0, pend_sig)
+            pend_sig = 0
+            _, st = os.waitpid(pid, 0)
+            if os.WIFEXITED(st) or os.WIFSIGNALED(st):
+                if sysrec:
+                    self.sys_end(sysrec, None)
+                self.rips.append(rip)
+                self.finish(st)
+                return
+            sig = os.WSTOPSIG(st)
+            if sig != signal.SIGTRAP:
+                pend_sig = sig
+                if sig in (signal.SIGSEGV, signal.SIGBUS, signal.SIGILL, signal.SIGFPE, signal.SIGABRT):
+                    self.on_crash(sig, rip, R)
+                R = getregs(pid)
+                continue
+            R2 = getregs(pid)
+            self.rips.append(rip)
+            step = self.steps
+            self.record(step, rip, R, R2, pl, eas, rvals, user, stk if (pl is not None and pl.cls in ("ret", "pop")) else None)
+            self.last_regs = R2
+            if sysrec:
+                self.sys_end(sysrec, R2[RAX])
+                if len(self.keyframes) < 1500:
+                    self.add_keyframe(step, R2)
+                sysrec = None
+            self.steps += 1
+            R = R2
+            self.last_regs = R2
+        else:
+            self.exit["truncated"] = f"max-steps {self.max_steps}"
+        if self.exit["truncated"] and self.pid:
+            self.close_span()
+            os.kill(self.pid, signal.SIGKILL)
+            os.waitpid(self.pid, 0)
+            self.output = (self.out_path.read_text(errors="replace") if self.out_path.exists() else "")[:4000]
+            self.errout = (self.err_path.read_text(errors="replace") if self.err_path.exists() else "")[:2000]
+            self.pid = None
+
+    def add_keyframe(self, step, R):
+        stack = [self.rdi(R[RSP] + 8 * i, 8) or 0 for i in range(16)]
+        self.keyframes.append({"step": step, "ev": len(self.events), "rip": R[RIP], "rsp": R[RSP], "rbp": R[RBP], "stack": stack,
+                               "heap": [len(self.live_allocs()), sum(a["size"] for a in self.live_allocs())]})
+
+    def live_allocs(self):
+        return [a for a in self.allocs if a["state"] == "live"]
+
+    def on_crash(self, sig, rip, R):
+        si = (ctypes.c_char * 128)()
+        pt(PT_GETSIGINFO, self.pid, 0, ctypes.addressof(si))
+        fault = int.from_bytes(bytes(si)[16:24], "little")
+        labs = set()
+        for r in ("rip", "rax", "rdi", "rsi"):
+            labs.update(x for x in self.rt.get(r, ()) if x is not None)
+        sv = signal.Signals(sig).name
+        self.finding("CRITICAL" if labs else "HIGH", "crash", f"{sv} in {self.symof(rip)[0]}" + (f" (fault address {fault:#x})" if sig == signal.SIGSEGV else ""),
+                     "the recorded input drives the process into a fatal signal" + (" with attacker-tainted registers" if labs else ""), rip, labs, {"fault_addr": fault})
+
+    def check_ret(self, sp, val, rip):
+        if val is None:
+            return
+        labs = self.labels_at(sp, 8)
+        if labs:
+            self.finding("CRITICAL", "control-hijack", f"return address is attacker-controlled ({val:#x})",
+                         "ret pops a value that came from input bytes: the program counter is now attacker-chosen", rip, labs, {"target": val})
+        self.slots.pop(sp, None)
+        if self.frames and len(self.frames) > 1:
+            self.frames.pop()
+
+
+# --------------------------------------------------------------------------- #
+#  per-instruction engine: memory events, taint, symbolic, heap, calls         #
+# --------------------------------------------------------------------------- #
+REGIDX = [(n, RI[n]) for n in GPR + ["rsp"]]
+
+
+def _tget(self, op, pl, eas):
+    k = op[0]
+    if k == "r":
+        t = self.rt.get(op[1], ())
+        return t[:op[2]] if t else ()
+    if k == "m":
+        if not self.mt:
+            return ()
+        a, sz = eas[op[1]], min(pl.mems[op[1]]["size"], 64)
+        t = tuple(self.mt.get(a + i) for i in range(sz))
+        return t if any(x is not None for x in t) else ()
+    return ()
+
+
+def _tset(self, op, t, pl, eas):
+    k = op[0]
+    if k == "r":
+        if t:
+            self.rt[op[1]] = t
+        else:
+            self.rt.pop(op[1], None)
+    elif k == "m":
+        a, sz = eas[op[1]], min(pl.mems[op[1]]["size"], 64)
+        for i in range(sz):
+            lab = t[i] if i < len(t) else None
+            if lab is None:
+                self.mt.pop(a + i, None)
+            else:
+                self.mt[a + i] = lab
+
+
+def taint_step(self, pl, R, R2, eas, rip):
+    c, ops = pl.cls, pl.ops
+    g, s = self._tget, self._tset
+    if c == "mov" and len(ops) > 1:
+        s(ops[0], g(ops[1], pl, eas), pl, eas)
+    elif c == "alu":
+        if pl.mn in ("xor", "sub", "pxor", "vpxor", "xorps") and len(ops) > 1 and ops[0] == ops[1]:
+            t = ()
+        else:
+            srcs = [g(o, pl, eas) for o in ops[1:]]
+            t = tmerge(srcs if pl.mn.startswith("v") else [g(ops[0], pl, eas)] + srcs)
+        s(ops[0], t, pl, eas)
+        self.flag_t = t
+    elif c == "cmp" and len(ops) > 1:
+        self.flag_t = tmerge([g(ops[0], pl, eas), g(ops[1], pl, eas)])
+    elif c == "unary":
+        s(ops[0], g(ops[0], pl, eas), pl, eas)
+    elif c == "lea" and len(ops) > 1 and ops[1][0] == "m":
+        s(ops[0], tmerge([self.rt.get(r, ()) for r, _ in pl.mems[ops[1][1]]["terms"]]), pl, eas)
+    elif c == "push" and ops:
+        t = g(ops[0], pl, eas)
+        for i in range(8):
+            lab = t[i] if i < len(t) else None
+            if lab is None: self.mt.pop(R[RSP] - 8 + i, None)
+            else: self.mt[R[RSP] - 8 + i] = lab
+    elif c == "pop" and ops:
+        t = tuple(self.mt.get(R[RSP] + i) for i in range(8))
+        s(ops[0], t if any(x is not None for x in t) else (), pl, eas)
+    elif c == "call":
+        for i in range(8):
+            self.mt.pop(R[RSP] - 8 + i, None)
+    elif c == "leave":
+        t = tuple(self.mt.get(R[RBP] + i) for i in range(8))
+        self.rt["rbp"] = t if any(x is not None for x in t) else ()
+        if not self.rt["rbp"]: self.rt.pop("rbp")
+    elif c == "xchg" and len(ops) > 1:
+        a, b = g(ops[0], pl, eas), g(ops[1], pl, eas)
+        s(ops[0], b, pl, eas); s(ops[1], a, pl, eas)
+    elif c == "cmov" and len(ops) > 1:
+        s(ops[0], tmerge([g(ops[0], pl, eas), g(ops[1], pl, eas)]), pl, eas)
+    elif c == "set" and ops:
+        s(ops[0], (), pl, eas)
+    elif c == "muldiv" and ops:
+        t = tmerge([self.rt.get("rax", ()), g(ops[0], pl, eas)])
+        for r in ("rax", "rdx"):
+            if t: self.rt[r] = t
+            else: self.rt.pop(r, None)
+    elif c == "str" and len(eas) >= 1:
+        if pl.mn == "movs" and len(eas) > 1:
+            for i in range(pl.mems[0]["size"]):
+                v = self.mt.get(eas[1] + i)
+                if v is None: self.mt.pop(eas[0] + i, None)
+                else: self.mt[eas[0] + i] = v
+        elif pl.mn == "stos" and len(ops) > 1:
+            s(ops[0], g(ops[1], pl, eas), pl, eas)
+        elif pl.mn == "lods" and len(ops) > 1:
+            s(ops[0], g(ops[1], pl, eas), pl, eas)
+    elif pl.mn == "syscall":
+        for r in ("rax", "rcx", "r11"):
+            self.rt.pop(r, None)
+    if c == "jcc" and self.flag_t:
+        labs = [x for x in self.flag_t if x is not None]
+        d = self.tainted_branch.setdefault(rip, {"n": 0, "labels": set(), "asm": pl.asm, "first": self.steps})
+        d["n"] += 1
+        if len(d["labels"]) < 6:
+            d["labels"].update(labs[:3])
+    if c in ("call", "jmp") and ops and ops[0][0] in ("r", "m"):
+        t = g(ops[0], pl, eas)
+        if t:
+            self.finding("CRITICAL", "control-hijack", f"indirect {c} target comes from input", f"{pl.asm} jumps through attacker-controlled data",
+                         rip, [x for x in t if x is not None], {"target": R2[RIP]})
+
+
+def _sget(self, op, pl, eas, R):
+    if op[0] == "i":
+        return ("", 0, op[1])
+    if op[0] == "r":
+        return self.rs.get(op[1])
+    if op[0] == "m":
+        return self.ms.get(eas[op[1]])
+    return None
+
+
+def _sset(self, op, e, eas):
+    if op[0] == "r":
+        if e and e[0]: self.rs[op[1]] = e
+        else: self.rs.pop(op[1], None)
+    elif op[0] == "m":
+        if e and e[0]: self.ms[eas[op[1]]] = e
+        else: self.ms.pop(eas[op[1]], None)
+
+
+def sym_step(self, pl, R, R2, eas, rip):
+    c, ops, mn = pl.cls, pl.ops, pl.mn
+    get = lambda o: self._sget(o, pl, eas, R)
+    out = None
+    dst = ops[0] if ops else None
+    if c == "mov" and len(ops) > 1:
+        out = get(ops[1]); self._sset(dst, out, eas)
+    elif c == "lea" and len(ops) > 1 and ops[1][0] == "m":
+        m = pl.mems[ops[1][1]]
+        sym, mul, add = None, 0, m["disp"]
+        ok = True
+        for r, sc in m["terms"]:
+            e = self.rs.get(r)
+            if e:
+                if sym is None or sym == e[0]:
+                    sym, mul, add = e[0], mul + e[1] * sc, add + e[2] * sc
+                else:
+                    ok = False
+            else:
+                add += ((rip + pl.ln) if r == "rip" else R[RI[r]] * sc if r in RI else 0)
+        out = (sym, mul, add) if ok and sym else None
+        self._sset(dst, out, eas)
+    elif c == "alu" and len(ops) > 1:
+        a, b = get(dst), get(ops[-1])
+        if mn in ("xor", "sub") and ops[0] == ops[1]:
+            out = None
+        elif mn in ("add", "sub") and a and b:
+            sg = 1 if mn == "add" else -1
+            if a[0] and not b[0]: out = (a[0], a[1], a[2] + sg * b[2])
+            elif b[0] and not a[0] and mn == "add": out = (b[0], b[1], b[2] + a[2])
+        elif mn == "imul":
+            src, imm = (get(ops[1]), get(ops[2])) if len(ops) == 3 else (a, b)
+            if src and src[0] and imm and not imm[0]: out = (src[0], src[1] * imm[2], src[2] * imm[2])
+        elif mn in ("shl", "sal") and a and a[0] and b and not b[0]:
+            out = (a[0], a[1] << b[2], a[2] << b[2])
+        self._sset(dst, out, eas)
+    elif c == "unary" and dst:
+        a = get(dst)
+        if a and a[0]:
+            out = {"inc": (a[0], a[1], a[2] + 1), "dec": (a[0], a[1], a[2] - 1), "neg": (a[0], -a[1], -a[2])}.get(mn)
+        self._sset(dst, out, eas)
+    elif c == "push" and ops:
+        e = get(ops[0])
+        if e and e[0]: self.ms[R[RSP] - 8] = e
+        else: self.ms.pop(R[RSP] - 8, None)
+    elif c == "pop" and ops:
+        self._sset(dst, self.ms.get(R[RSP]), eas)
+    elif c == "cmp" and len(ops) > 1:
+        a, b = get(ops[0]), get(ops[1])
+        if pl.mn == "test" and ops[0] == ops[1] and a and a[0]:
+            self.last_cmp = (a, 0)
+        elif a and a[0] and b and not b[0]:
+            self.last_cmp = (a, b[2])
+        else:
+            self.last_cmp = None
+    elif c == "jcc" and self.last_cmp and pl.cc:
+        e, k = self.last_cmp
+        taken = R2[RIP] != rip + pl.ln
+        op = pl.cc if taken else INVERT[pl.cc]
+        lhs = e[0] if (e[1] == 1) else fmt_sym((e[0], e[1], 0))
+        rhs = k - e[2] if e[1] == 1 else k - e[2]
+        text = f"{lhs} {op} {rhs}" if "0" not in op or op in ("<0", ">=0") and False else f"{lhs} {op} {rhs}"
+        if op in ("<0", ">=0"):
+            text = f"{fmt_sym(e)} {op}"
+        if self.constraints and self.constraints[-1]["rip"] == rip and self.constraints[-1]["text"] == text:
+            self.constraints[-1]["n"] += 1
+        elif len(self.constraints) < 300:
+            self.constraints.append({"rip": rip, "text": text, "n": 1, "step": self.steps, "taken": taken})
+        self.last_cmp = None
+    if c in ("mov", "lea", "alu", "unary") and out and out[0] and (out[1] != 1 or out[2] != 0) and len(self.sym_events) < 1500:
+        txt = fmt_sym(out)
+        nm = dst[1] if dst[0] == "r" else "mem"
+        key = (rip, txt)
+        if key not in self._symseen:
+            self._symseen.add(key)
+            self.sym_events.append({"step": self.steps, "rip": rip, "dst": nm, "expr": txt})
+
+
+def on_mem(self, k, a, sz, v, rip, pl, step, user):
+    # ---- return-address smash
+    if k == "W" and self.slots and pl.cls != "call":
+        for s, fn in list(self.slots.items()):
+            if a <= s < a + sz:
+                labs = self.labels_at(s, 8)
+                self.finding("CRITICAL", "stack-smash", f"saved return address of {fn}() overwritten at {s:#x}",
+                             f"{pl.asm} wrote {sz} bytes over the return slot", rip, labs, {"slot": s, "value": v})
+    # ---- heap model
+    if self.alloc_depth == 0 and self.bstarts:
+        i = bisect.bisect_right(self.bstarts, a) - 1
+        if i >= 0:
+            rec = self.blocks[self.bstarts[i]]
+            st, size = rec["ptr"], rec["size"]
+            if rec["state"] == "freed" and st <= a < st + max(size, 1):
+                labs = self.labels_at(a, 1) if k == "W" else ()
+                self.finding("HIGH", "use-after-free", f"{'write' if k == 'W' else 'read'} of freed block #{rec['id']} ({size}B) at +{a - st}",
+                             f"block freed at step {rec['freed_step']}; {pl.asm}", rip, labs, {"block": rec["id"], "alloc": hx(st)})
+            elif rec["state"] == "live":
+                usable = ((size + 8 + 15) // 16) * 16 - 8
+                if st <= a < st + max(size, 1):
+                    self.heap_access[(rip, rec["id"], k)] += 1
+                elif a + sz > st + usable and a < st + usable + 16:
+                    labs = self.labels_at(a, sz) if k == "W" else ()
+                    self.finding("HIGH" if k == "W" else "MEDIUM", "heap-overflow",
+                                 f"heap {'overflow' if k == 'W' else 'over-read'} past block #{rec['id']} ({size}B)",
+                                 f"{pl.asm} touches {a:#x}: {a - (st + size)} bytes beyond the allocation", rip, labs, {"block": rec["id"]})
+    # ---- variable naming (DWARF + CFA)
+    if user and self.frames:
+        fr = self.frames[-1]
+        fv = self._fvars(rip)
+        for var in fv:
+            va = fr["cfa"] + var["fbreg"]
+            if va <= a < va + max(var["size"], 1):
+                self.var_access[(rip, var["name"], k)] += 1
+                if k == "W" and sz <= 8 and v is not None and len(self.ranges[(rip, "v", var["name"])]) < 600:
+                    self.ranges[(rip, "v", var["name"])].append(v)
+                return var["name"]
+    return None
+
+
+def _fvars(self, rip):
+    if rip in self._fvc:
+        return self._fvc[rip]
+    base = self.maps.base.get(self.info.exe, 0) if self.info.pie else 0
+    f = self.info.dwarf.func_at(rip - base)
+    vs = [v for v in f["vars"] if v["fbreg"] is not None and v["name"]] if f else []
+    self._fvc[rip] = vs
+    return vs
+
+
+def new_alloc(self, ptr, n, step, site):
+    self.aid += 1
+    rec = {"id": self.aid, "ptr": ptr, "size": n, "step": step, "site": site, "state": "live", "freed_step": None, "free_site": None}
+    self.allocs.append(rec)
+    if ptr not in self.blocks:
+        bisect.insort(self.bstarts, ptr)
+    self.blocks[ptr] = rec
+    self.close_span()
+    self.events.append({"t": "h", "s": step, "text": f"malloc({n}) → {ptr:#x}  [#{rec['id']}]", "id": rec["id"]})
+
+
+def do_free(self, p, step, site, rip):
+    if not p:
+        return
+    rec = self.blocks.get(p)
+    if rec is None:
+        i = bisect.bisect_right(self.bstarts, p) - 1
+        inner = i >= 0 and self.blocks[self.bstarts[i]]["ptr"] < p < self.blocks[self.bstarts[i]]["ptr"] + self.blocks[self.bstarts[i]]["size"]
+        self.finding("HIGH", "invalid-free", f"free({p:#x}) of a pointer malloc never returned" + (" (interior pointer)" if inner else ""), "undefined behaviour in the allocator", site)
+    elif rec["state"] == "freed":
+        self.finding("CRITICAL", "double-free", f"double free of block #{rec['id']} ({rec['size']}B)",
+                     f"first freed at step {rec['freed_step']}, again at step {step}", site, (), {"block": rec["id"], "alloc": hx(p)})
+    else:
+        rec["state"], rec["freed_step"], rec["free_site"] = "freed", step, site
+        self.close_span()
+        self.events.append({"t": "h", "s": step, "text": f"free({p:#x})  [#{rec['id']}]", "id": rec["id"]})
+
+
+def norm_fn(n):
+    n = re.sub(r"_chk$", "", n)
+    n = re.sub(r"_(avx2|evex|sse2|ssse3|sse4_\d|sse42|avx512\w*|unaligned\w*|erms|generic|avx)(_\w+)?$", "", n)
+    return re.sub(r"^__(?=[a-z])", "", n).replace("_IO_puts", "puts")
+
+
+def entry_hook(self, name, R2, step, rip_from, user_site=True):
+    a = [R2[RDI], R2[RSI], R2[RDX], R2[RCX], R2[R8], R2[R9]]
+    if name in ALLOCS and self.alloc_depth == 0:
+        ret = self.rdi(R2[RSP], 8) or 0
+        if name == "free":
+            self.do_free(a[0], step, ret, rip_from)
+            self.alloc_depth += 1
+            self.pending_alloc.append({"fn": "free", "ret": ret, "rsp": R2[RSP], "a": a})
+        else:
+            self.alloc_depth += 1
+            self.pending_alloc.append({"fn": name, "ret": ret, "rsp": R2[RSP], "a": a})
+    if not user_site:
+        return a
+    if name in FMT_SINK:
+        ptr = a[FMT_SINK[name]]
+        labs = self.labels_at(ptr, 24)
+        if labs:
+            self.finding("HIGH", "format-string", f"input used as format string in {name}()", f"format \"{self.cstr(ptr, 48)}\" is attacker-influenced → %n / %s read-write primitive", rip_from, labs)
+    if name in EXEC_SINK:
+        labs = self.labels_at(a[EXEC_SINK[name]], 32)
+        if labs:
+            self.finding("CRITICAL", "command-injection", f"input reaches {name}(\"{self.cstr(a[0], 60)}\")", "attacker-controlled command line", rip_from, labs)
+    if name in COPY_SINK:
+        src = a[0] if name == "gets" else a[1]
+        labs = self.labels_at(src, 64) if name != "gets" else set()
+        n = len(self.cstr(src, 512)) if name != "gets" else -1
+        self.finding("HIGH" if name == "gets" else "MEDIUM", "unbounded-copy", f"{name}() with {'unbounded stdin' if name == 'gets' else 'attacker data'} ({n if n >= 0 else '?'} bytes) into {a[0]:#x}",
+                     "no length limit: whether this smashes memory depends on the destination size", rip_from, labs, {"dest": hx(a[0]), "len": n})
+    if name in SIZE_SINK:
+        t = self.rt.get(ARGREG[SIZE_SINK[name]], ())
+        if t and any(x is not None for x in t):
+            self.finding("MEDIUM", "tainted-size", f"attacker-controlled size passed to {name}() = {a[SIZE_SINK[name]]}", "length/size derives from input", rip_from, [x for x in t if x is not None])
+    return a
+
+
+def alloc_return(self, R2, step):
+    pa = self.pending_alloc.pop()
+    self.alloc_depth -= 1
+    n, a = pa["fn"], pa["a"]
+    rax = R2[RAX]
+    if n == "malloc" and rax: self.new_alloc(rax, a[0], step, pa["ret"])
+    elif n == "calloc" and rax: self.new_alloc(rax, a[0] * a[1], step, pa["ret"])
+    elif n == "realloc" and rax:
+        if a[0] and a[0] in self.blocks and self.blocks[a[0]]["state"] == "live":
+            self.blocks[a[0]]["state"], self.blocks[a[0]]["freed_step"], self.blocks[a[0]]["free_site"] = "freed", step, pa["ret"]
+        self.new_alloc(rax, a[1], step, pa["ret"])
+
+
+def record(self, step, rip, R, R2, pl, eas, rvals, user, stk):
+    nxt = R2[RIP]
+    sy = self.symof(rip)
+    fn = sy[0]
+    self.fn_steps[fn] += 1
+    self.fn_obj[fn] = sy[2]
+    if pl is None:
+        self._event(step, rip, fn, sy, None, R, R2, [], user)
+        return
+    c = pl.cls
+    # ---- memory events
+    mev = []
+    for idx, mode in pl.modes.items():
+        sz = pl.mems[idx]["size"]
+        if "r" in mode:
+            mev.append(["R", eas[idx], sz, rvals.get(idx)])
+        if "w" in mode:
+            mev.append(["W", eas[idx], sz, self.rdi(eas[idx], min(sz, 16))])
+    if c in ("push", "call"):
+        mev.append(["W", R[RSP] - 8, 8, self.rdi(R[RSP] - 8, 8)])
+    elif c in ("pop", "ret"):
+        mev.append(["R", R[RSP], 8, stk])
+    elif c == "leave":
+        mev.append(["R", R[RBP], 8, self.rdi(R[RBP], 8)])
+    # ---- propagate
+    tflag = False
+    if self.mt or self.rt or self.flag_t:
+        tflag = any(self.rt.get(r) for r in pl.rr) or any(m[0] == "R" and self.labels_at(m[1], min(m[2], 16)) for m in mev)
+        self.taint_step(pl, R, R2, eas, rip)
+    if user:
+        self.sym_step(pl, R, R2, eas, rip)
+    # ---- memory consumers
+    names = []
+    for k, a, sz, v in mev:
+        if len(self.mem) < 400000:
+            self.mem.append((step, k, a, sz, v, rip))
+        nm = self.on_mem(k, a, sz, v, rip, pl, step, user)
+        if nm:
+            names.append(nm)
+    # ---- def-use + ranges (user code)
+    if user:
+        self.hits[rip] += 1
+        self.succ[(rip, nxt)] += 1
+        if len(self.defuse) < 30000:
+            for r in pl.rr:
+                d = self.lastdef.get(r)
+                if d is not None:
+                    self.defuse[(d, rip, r, tflag)] += 1
+            for k, a, sz, v in mev:
+                if k == "R" and a in self.lastdef_mem:
+                    self.defuse[(self.lastdef_mem[a], rip, "mem", tflag)] += 1
+        for r in pl.rw:
+            self.lastdef[r] = rip
+            if r in GPR:
+                lst = self.ranges[(rip, "r", r)]
+                if len(lst) < 600:
+                    lst.append(R2[RI[r]])
+        for k, a, sz, v in mev:
+            if k == "W":
+                self.lastdef_mem[a] = rip
+    # ---- call / ret / entry
+    if c == "call":
+        cs = self.symof(nxt)
+        top = self.frames[-1]["fn"] if self.frames else "?"
+        self.calls[(top, cs[0])] += 1
+        self.frames.append({"fn": cs[0], "ret": rip + pl.ln, "cfa": R[RSP], "slot": R2[RSP], "user": False})
+        self.slots[R2[RSP]] = cs[0]
+        if user and not self.info.user_func(nxt - (self.maps.base.get(self.info.exe, 0) if self.info.pie else 0)):
+            self.lastdef["rax"] = self.lastdef["rdx"] = "fn:" + cs[0]
+        if cs[0].endswith("@plt"):
+            self.pending_plt[rip + pl.ln] = cs[0]
+            self.entry_hook(norm_fn(cs[0][:-4]), R2, step, rip, user)
+        if pl.ops and pl.ops[0][0] in ("r", "m"):
+            self.indirect[(fn, rip)].add(cs[0])
+        if cs[0] in ("__cxa_throw", "_Unwind_RaiseException", "__cxa_allocate_exception") and len(self.exc) < 40:
+            self.exc.append({"fn": cs[0], "from": fn, "step": step})
+    elif c == "ret" and pl.ops:
+        pass
+    if nxt in self.pending_plt:
+        stub = self.pending_plt.pop(nxt)
+        nm = stub[:-4]
+        for d in self.info.facts["plt"].values():
+            if d["name"] == nm:
+                v = self.rdi(d["got"], 8)
+                if v:
+                    r = self.symof(v)
+                    self.plt_res[stub] = {"resolved": r[0], "obj": r[2], "addr": v, "got": d["got"]}
+                break
+    if nxt != rip + pl.ln or c == "call":
+        n2 = self.symof(nxt)
+        if n2[1] == 0:
+            if not fn.endswith("@plt") and not n2[0].endswith("@plt"):
+                self.entry_hook(norm_fn(n2[0]), R2, step, rip, user)
+            if self.info.dwarf.func_at(nxt - (self.maps.base.get(self.info.exe, 0) if self.info.pie else 0)) and self.rt:
+                for r in ARGREG[:4]:
+                    if self.rt.get(r) or (R2[RI[r]] > 0x1000 and self.labels_at(R2[RI[r]], 16)):
+                        self.tainted_args[n2[0]].add(r)
+    if self.pending_alloc and nxt == self.pending_alloc[-1]["ret"] and R2[RSP] == self.pending_alloc[-1]["rsp"] + 8:
+        self.alloc_return(R2, step)
+    if step % 250 == 0 and len(self.keyframes) < 1500:
+        self.add_keyframe(step, R2)
+    self._event(step, rip, fn, sy, pl, R, R2, mev, user, names)
+
+
+def _event(self, step, rip, fn, sy, pl, R, R2, mev, user, names=()):
+    if user and pl is not None and self.n_user_ev < 9000:
+        self.close_span()
+        self.n_user_ev += 1
+        chg = {n: [R[i], R2[i]] for n, i in REGIDX if R[i] != R2[i]}
+        self.events.append({"t": "i", "s": step, "rip": rip, "asm": pl.asm, "raw": pl.raw, "fn": fn, "chg": chg,
+                            "mem": [[k, a, sz, v] for k, a, sz, v in mev][:4], "var": list(names)[:2]})
+        return
+    sp = self.cur_span
+    if sp and sp["fn"] == fn:
+        sp["n"] += 1
+    else:
+        self.close_span()
+        self.cur_span = sp = {"t": "s", "s": step, "fn": fn, "obj": sy[2], "n": 1, "r0": list(R)}
+        self.events.append(sp)
+    self.last_regs = R2
+
+
+for _f in (_tget, _tset, taint_step, _sget, _sset, sym_step, on_mem, _fvars, new_alloc, do_free, entry_hook, alloc_return, record, _event):
+    setattr(Tracer, _f.__name__.lstrip("_") if _f.__name__.startswith(("_tget", "_tset", "_sget", "_sset")) else _f.__name__, _f)
+Tracer._tget, Tracer._tset, Tracer._sget, Tracer._sset, Tracer._fvars, Tracer._event = _tget, _tset, _sget, _sset, _fvars, _event
+
+
+# =========================================================================== #
+#  5/6. WHOLE-PROGRAM STRUCTURE + TYPED GRAPH MODEL                           #
+# =========================================================================== #
+def basic_blocks(tr: Tracer, info: BinInfo):
+    """Derive basic blocks for user functions from the recorded successor edges."""
+    leaders = defaultdict(set)
+    heads = defaultdict(lambda: None)
+    fn_of = {}
+    for rip in tr.hits:
+        fn_of[rip] = tr.symof(rip)[0]
+    for rip in tr.hits:
+        leaders[fn_of[rip]].add(rip)
+    for (a, b), n in tr.succ.items():
+        fa, fb = fn_of.get(a), fn_of.get(b)
+        if fb and (fb != fa or b != a + 1):
+            leaders[fb].add(b)
+    blocks = {}
+    for fn, lp in leaders.items():
+        addrs = sorted(lp)
+        ends = {addrs[i]: addrs[i + 1] for i in range(len(addrs) - 1)}
+        for i, a in enumerate(addrs):
+            bid = f"{fn}:{a:#x}"
+            blocks[bid] = {"id": bid, "fn": fn, "lo": a, "hi": ends.get(a), "hits": sum(tr.hits[x] for x in tr.hits if x >= a and (ends.get(a) is None or x < ends[a]) and fn_of.get(x) == fn)}
+    bedges = []
+    for (a, b), n in tr.succ.items():
+        fa, fb = fn_of.get(a), fn_of.get(b)
+        if fa is None or fb is None:
+            continue
+        ba = next((bid for bid, bd in blocks.items() if bd["fn"] == fa and bd["lo"] <= a < (bd["hi"] or 1 << 63)), None)
+        bb = next((bid for bid, bd in blocks.items() if bd["fn"] == fb and bd["lo"] == b), None)
+        if ba and bb and ba != bb:
+            bedges.append({"from": ba, "to": bb, "n": n})
+    return blocks, bedges
+
+
+def build_graph(tr: Tracer, info: BinInfo, src_name: str):
+    nodes, edges = {}, []
+
+    def add(nid, typ, **kw):
+        if nid not in nodes:
+            nodes[nid] = {"id": nid, "type": typ, **kw}
+        else:
+            nodes[nid].update(kw)
+        return nid
+
+    def E(a, b, typ, **kw):
+        edges.append({"from": a, "to": b, "type": typ, **kw})
+
+    add("process", "process", label=Path(info.exe).name, pid=tr.pid, exit=tr.exit, argv=getattr(tr, "argv_seen", []))
+    add("thread:main", "thread", label="main thread", parent="process")
+    E("process", "thread:main", "spawn")
+    for th in tr.threads:
+        tid = f"thread:{th['child']}"
+        add(tid, "thread", label=f"{th['kind']} → tid {th['child']}", parent="process", step=th["step"])
+        E("thread:main", tid, "spawn", step=th["step"])
+
+    fstatus = info.dwarf.status
+    allf = set(tr.fn_steps) | set(tr.hits and {tr.symof(r)[0] for r in tr.hits})
+    for fn in sorted(allf):
+        obj = tr.fn_obj.get(fn, info.exe if fn in info.sym.by_name else "")
+        isuser = bool(info.dwarf.func_at(info.sym.by_name.get(fn, -1))) if fn in info.sym.by_name else False
+        nid = f"fn:{fn}"
+        add(nid, "function", label=fn, steps=tr.fn_steps.get(fn, 0), obj=os.path.basename(obj) if obj else "?",
+            user=isuser, tainted_args=sorted(tr.tainted_args.get(fn, ())), compiler=fstatus.get(fn))
+    for (a, b), n in tr.calls.items():
+        E(f"fn:{a}", f"fn:{b}", "call", n=n)
+    for (fn, rip), targets in tr.indirect.items():
+        for t in targets:
+            E(f"fn:{fn}", f"fn:{t}", "indirect-call", rip=rip)
+
+    blocks, bedges = basic_blocks(tr, info)
+    for bid, b in blocks.items():
+        add(bid, "block", parent=f"fn:{b['fn']}", lo=hx(b["lo"]), hi=hx(b["hi"]) if b["hi"] else None, hits=b["hits"])
+        E(f"fn:{b['fn']}", bid, "contains")
+    for be in bedges:
+        E(be["from"], be["to"], "cflow", n=be["n"])
+
+    for name, fd in tr.fdnodes.items():
+        nid = f"fd:{name}"
+        typ = {"file": "file", "socket": "socket"}.get(fd.get("kind"), "stream")
+        add(nid, typ, label=fd.get("path", str(name)), reads=fd.get("reads", 0), writes=fd.get("writes", 0), bytes=fd.get("bytes", 0))
+        if fd.get("reads"):
+            E(nid, "thread:main", "read", n=fd["reads"])
+        if fd.get("writes"):
+            E("thread:main", nid, "write", n=fd["writes"])
+    syscnt = Counter(s["name"] for s in tr.syscalls)
+    for nm, n in syscnt.items():
+        nid = f"sys:{nm}"
+        add(nid, "syscall", label=nm, n=n)
+        E("thread:main", nid, "syscall", n=n)
+
+    for lib in info.facts["libs"]:
+        nid = f"lib:{lib['soname']}"
+        add(nid, "library", label=lib["soname"], path=lib["path"])
+        E("process", nid, "link")
+
+    for a in tr.allocs:
+        nid = f"heap:{a['id']}"
+        add(nid, "heap_block", label=f"#{a['id']} {a['size']}B", size=a["size"], state=a["state"],
+            alloc_step=a["step"], free_step=a["freed_step"], addr=hx(a["ptr"]))
+        site = tr.symof(a["site"])[0] if a["site"] else "?"
+        E(f"fn:{site}", nid, "alloc", step=a["step"])
+        for (rip, aid, k), n in tr.heap_access.items():
+            if aid == a["id"]:
+                E(f"fn:{tr.symof(rip)[0]}", nid, "read" if k == "R" else "write", n=n)
+
+    for f in tr.findings:
+        nid = f"finding:{len(nodes)}"
+        add(nid, "finding", label=f["title"], sev=f["sev"], kind=f["kind"], step=f["step"], detail=f["detail"], witness=f["witness"])
+        site = tr.symof(f["rip"])[0] if isinstance(f["rip"], int) else "?"
+        E(f"fn:{site}", nid, "finds", step=f["step"])
+        for tag in f["witness"]["input_bytes"]:
+            snode = f"src:{tag}"
+            add(snode, "input_source", label=tag)
+            E(snode, nid, "taint", offsets=f["witness"]["input_bytes"][tag])
+
+    for (d, u, via, t), n in tr.defuse.items():
+        if t and n >= 1 and isinstance(d, int) and isinstance(u, int):
+            E(f"fn:{tr.symof(d)[0]}", f"fn:{tr.symof(u)[0]}", "dataflow", via=via, n=n, tainted=True)
+
+    struct_nodes = []
+    for s in info.dwarf.structs[:60]:
+        nid = f"struct:{s['name']}:{s['size']}"
+        add(nid, "struct", label=s["name"], size=s["size"], members=s["members"], kind=s["kind"])
+        struct_nodes.append(nid)
+    return {"nodes": list(nodes.values()), "edges": edges}, blocks, bedges
+
+
+def call_graph_text(tr: Tracer):
+    out, seen = [], set()
+    order = sorted(tr.calls, key=lambda k: -tr.calls[k])
+    children = defaultdict(list)
+    for (a, b), n in tr.calls.items():
+        children[a].append((b, n))
+    roots = set(children) - {b for lst in children.values() for b, _ in lst}
+
+    def walk(fn, d, path):
+        if d > 6 or fn in path:
+            return [f"{'  ' * d}{fn} (recursion)" if fn in path else ""]
+        rows = []
+        kids = sorted(children.get(fn, []), key=lambda x: -x[1])
+        for k, n in kids[:8]:
+            rows.append(f"{'  ' * d}└─ {k}  ×{n}")
+            rows += walk(k, d + 1, path | {fn})
+        return rows
+    for r in sorted(roots or {"main"}):
+        out.append(r)
+        out += walk(r, 1, set())
+    return out
+
+
+# --------------------------------------------------------------------------- #
+#  two-run diff                                                                #
+# --------------------------------------------------------------------------- #
+def diff_runs(a: Tracer, b: Tracer):
+    n = min(len(a.rips), len(b.rips))
+    lo, hi = 0, n
+    # binary search for first divergence for speed on long traces
+    step = 4096
+    i = 0
+    while i < n and a.rips[i] == b.rips[i]:
+        i += 1
+    point = i
+    window = []
+    for j in range(max(0, point - 3), min(n, point + 12)):
+        window.append({"step": j, "a": hx(a.rips[j]) if j < len(a.rips) else None, "b": hx(b.rips[j]) if j < len(b.rips) else None,
+                       "sym_a": a.symof(a.rips[j])[0] if j < len(a.rips) else None, "sym_b": b.symof(b.rips[j])[0] if j < len(b.rips) else None})
+    sys_a = [s["text"] for s in a.syscalls]
+    sys_b = [s["text"] for s in b.syscalls]
+    k = 0
+    while k < min(len(sys_a), len(sys_b)) and sys_a[k] == sys_b[k]:
+        k += 1
+    return {
+        "diverged_at_step": point if point < n else None,
+        "window": window,
+        "len_a": len(a.rips), "len_b": len(b.rips),
+        "syscall_divergence": k if k < min(len(sys_a), len(sys_b)) else None,
+        "syscalls_a_tail": sys_a[k:k + 6], "syscalls_b_tail": sys_b[k:k + 6],
+        "exit_a": a.exit, "exit_b": b.exit,
+        "findings_only_a": [f["title"] for f in a.findings if f["title"] not in {g["title"] for g in b.findings}],
+        "findings_only_b": [f["title"] for f in b.findings if f["title"] not in {g["title"] for g in a.findings}],
+    }
+
+
+def to_dot(graph):
+    shape = {"process": "doubleoctagon", "thread": "octagon", "function": "box", "block": "ellipse",
+             "file": "folder", "socket": "component", "syscall": "diamond", "heap_block": "note",
+             "finding": "octagon", "library": "tab", "struct": "record", "input_source": "cds"}
+    color = {"finding": "#ff5566", "function": "#8be9fd", "syscall": "#ffcc66", "heap_block": "#bd93f9",
+             "file": "#6ee7b0", "socket": "#6ee7b0", "library": "#626496", "input_source": "#ff79c6"}
+    lines = ["digraph asmx_omni {", '  bgcolor="#0b0d1a"; fontcolor="white"; node [style=filled,fontsize=10];']
+    for n in graph["nodes"]:
+        if n["type"] == "block":
+            continue
+        lines.append(f'  "{n["id"]}" [label="{n.get("label", n["id"])[:40]}",shape={shape.get(n["type"], "box")},'
+                     f'fillcolor="{color.get(n["type"], "#2a2d55")}",fontcolor="#0b0d1a"];')
+    for e in graph["edges"]:
+        if e["from"].startswith(("fn:",)) is False and e["type"] == "contains":
+            continue
+        if any(x.split(":")[0] == "block" and ":" in x for x in (e["from"],)) and e["type"] in ("contains", "cflow"):
+            continue
+        lines.append(f'  "{e["from"]}" -> "{e["to"]}" [label="{e["type"]}",color="#555a99",fontcolor="#8888bb",fontsize=8];')
+    lines.append("}")
+    return "\n".join(lines)
+HTML_TEMPLATE = r"""<!doctype html><html><head><meta charset="utf-8">
+<title>asmx \u03a9 :: __TITLE__</title>
+<style>
+:root{--bg:#060714;--bg2:#0b0e22;--panel:#0d1026ee;--line:#262b55;--txt:#dce2ff;--dim:#6b72a8;
+--accent:#7df9ff;--pink:#ff5fb0;--gold:#ffd27a;--bad:#ff4d6d;--ok:#5dffb0;--warn:#ffb454;--purple:#b388ff;}
+*{box-sizing:border-box}
+body{margin:0;background:radial-gradient(ellipse at 50% -10%,#141a3d 0%,var(--bg) 55%);color:var(--txt);
+font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow:hidden}
+#stars{position:fixed;inset:0;z-index:0;pointer-events:none}
+#domain{position:fixed;inset:0;z-index:50;background:#000;display:flex;align-items:center;justify-content:center;
+flex-direction:column;transition:opacity 1.1s ease;color:#fff;text-align:center}
+#domain h1{font-size:min(7vw,64px);letter-spacing:.15em;margin:0;font-weight:200;
+background:linear-gradient(90deg,var(--accent),var(--pink),var(--gold));-webkit-background-clip:text;background-clip:text;color:transparent;
+text-shadow:0 0 60px rgba(125,249,255,.3)}
+#domain p{color:var(--dim);letter-spacing:.3em;text-transform:uppercase;font-size:11px;margin-top:10px}
+#domain.hide{opacity:0;pointer-events:none}
+#app{position:relative;z-index:1;display:grid;grid-template-columns:280px 1fr 320px;grid-template-rows:48px 1fr 150px;
+height:100vh;gap:1px;background:var(--line)}
+header{grid-column:1/4;display:flex;align-items:center;gap:14px;padding:0 14px;background:var(--panel);backdrop-filter:blur(6px)}
+header .logo{font-weight:700;letter-spacing:.08em;background:linear-gradient(90deg,var(--accent),var(--pink));
+-webkit-background-clip:text;background-clip:text;color:transparent}
+header .meta{color:var(--dim);font-size:11px}
+header .sev{display:flex;gap:8px;margin-left:auto}
+.badge{padding:2px 9px;border-radius:20px;font-size:11px;border:1px solid var(--line)}
+#left{background:var(--panel);overflow-y:auto;padding:10px}
+#center{background:#070915;position:relative;overflow:hidden}
+#right{background:var(--panel);overflow-y:auto;padding:10px}
+#bottom{grid-column:1/4;background:var(--panel);display:flex;flex-direction:column;padding:8px 14px;gap:6px}
+h3{margin:14px 0 6px;font-size:10px;text-transform:uppercase;letter-spacing:.15em;color:var(--dim)}
+h3:first-child{margin-top:0}
+.row{display:flex;align-items:center;justify-content:space-between;padding:4px 6px;border-radius:5px;cursor:pointer;font-size:12px}
+.row:hover{background:#ffffff0c}
+.row.sel{background:#7df9ff22;border:1px solid #7df9ff55}
+.chip{display:inline-block;padding:1px 6px;border-radius:9px;font-size:10px;margin-left:6px}
+.c-CRITICAL{background:#ff4d6d33;color:#ff9fb0}.c-HIGH{background:#ffb45433;color:#ffcf9b}
+.c-MEDIUM{background:#ffd27a33;color:#ffe3ab}.c-LOW{background:#5dffb033;color:#a9ffd9}.c-INFO{background:#6b72a833;color:#b7bbe6}
+button,select,input[type=text]{background:#12152f;border:1px solid var(--line);color:var(--txt);border-radius:6px;
+padding:5px 9px;font:inherit;cursor:pointer}
+button:hover{border-color:var(--accent)}
+button.on{background:var(--accent);color:#06121a;font-weight:700}
+#filters{display:flex;gap:6px;flex-wrap:wrap;padding:8px 0;border-bottom:1px solid var(--line);margin-bottom:8px}
+#filters button{padding:3px 8px;font-size:11px}
+#svgwrap{width:100%;height:100%;cursor:grab}
+#svgwrap:active{cursor:grabbing}
+.nlabel{fill:var(--txt);font-size:9px;pointer-events:none;font-family:inherit}
+.elabel{fill:var(--dim);font-size:8px;pointer-events:none}
+#tooltip{position:absolute;background:#0a0c20ee;border:1px solid var(--accent);border-radius:8px;padding:8px 10px;
+font-size:11px;pointer-events:none;max-width:320px;z-index:20;display:none;box-shadow:0 0 30px #7df9ff33}
+#tooltip b{color:var(--accent)}
+#crumbs{position:absolute;top:10px;left:10px;display:flex;gap:6px;z-index:5;font-size:11px}
+#crumbs span{background:#0a0c20cc;border:1px solid var(--line);border-radius:5px;padding:3px 9px;cursor:pointer}
+#crumbs span:hover{border-color:var(--accent)}
+#legend{position:absolute;bottom:10px;right:10px;background:#0a0c20cc;border:1px solid var(--line);border-radius:8px;
+padding:8px 10px;font-size:10px;z-index:5;display:grid;grid-template-columns:1fr;gap:3px}
+#legend i{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+#timeline{flex:1;position:relative;background:#070915;border-radius:6px;border:1px solid var(--line);overflow:hidden}
+#tl-canvas{width:100%;height:100%;display:block}
+#playbar{display:flex;align-items:center;gap:8px}
+#scrub{flex:1}
+.asmline{white-space:pre;font-size:11px;padding:1px 4px}
+.asmline.cur{background:#7df9ff22;border-left:2px solid var(--accent)}
+.mono{font-family:inherit}
+#detail pre{white-space:pre-wrap;font-size:11px;color:#b9c1ff;background:#06081a;padding:8px;border-radius:6px;border:1px solid var(--line)}
+a{color:var(--accent)}
+::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-thumb{background:#262b55;border-radius:4px}
+.flowpulse{filter:drop-shadow(0 0 4px var(--accent))}
+</style></head>
+<body>
+<canvas id="stars"></canvas>
+<div id="domain"><h1 id="domtitle">UNLIMITED VOID</h1><p id="domsub">binding vow · asmx \u03a9 engine</p></div>
+<div id="app">
+<header>
+  <span class="logo">ASMX \u03a9</span>
+  <span class="meta" id="hdrmeta">__META__</span>
+  <div class="sev" id="hdrsev"></div>
+</header>
+<div id="left">
+  <h3>Domain</h3>
+  <div style="display:flex;gap:6px;flex-wrap:wrap">
+    <button data-dom="gojo">Gojo</button><button data-dom="sukuna">Sukuna</button><button data-dom="cosmos" class="on">Cosmos</button>
+  </div>
+  <h3>Level</h3>
+  <div id="levelBtns" style="display:flex;gap:6px;flex-wrap:wrap"></div>
+  <h3>Node types</h3>
+  <div id="typeToggles"></div>
+  <h3>Search</h3>
+  <input type="text" id="search" placeholder="function, file, finding\u2026" style="width:100%">
+  <div id="searchResults"></div>
+  <h3>Findings (<span id="fcount">0</span>)</h3>
+  <div id="findingsList"></div>
+  <h3>Export</h3>
+  <div style="display:flex;gap:6px;flex-wrap:wrap">
+    <button id="expjson">JSON</button><button id="expdot">DOT</button><button id="exphtml">standalone</button>
+  </div>
+</div>
+<div id="center">
+  <div id="crumbs"></div>
+  <div id="legend"></div>
+  <div id="tooltip"></div>
+  <svg id="svgwrap" xmlns="http://www.w3.org/2000/svg"></svg>
+</div>
+<div id="right">
+  <h3>Selection</h3>
+  <div id="detail">click a node to inspect it</div>
+</div>
+<div id="bottom">
+  <div id="playbar">
+    <button id="playpause">\u25b6</button>
+    <span id="stepLabel" class="mono" style="min-width:150px">step 0 / 0</span>
+    <input type="range" id="scrub" min="0" max="1000" value="0">
+    <select id="speed"><option value="4">0.25x</option><option value="2">0.5x</option><option value="1" selected>1x</option>
+      <option value="0.25">4x</option><option value="0.05">20x</option></select>
+    <span class="meta" id="runmeta"></span>
+  </div>
+  <div id="timeline"><canvas id="tl-canvas"></canvas></div>
+</div>
+</div>
+<script>
+const DATA = __DATA_JSON__;
+</script>
+<script>
+__APP_JS__
+</script>
+</body></html>"""
+APP_JS = r"""
+// ---------------------------------------------------------------- starfield
+(function(){
+  const c=document.getElementById('stars'),ctx=c.getContext('2d');
+  function size(){c.width=innerWidth;c.height=innerHeight;}
+  size(); addEventListener('resize',size);
+  const N=160, stars=Array.from({length:N},()=>({x:Math.random()*c.width,y:Math.random()*c.height,r:Math.random()*1.3+.2,p:Math.random()*6.28,s:Math.random()*.02+.005}));
+  function tick(){ctx.clearRect(0,0,c.width,c.height);
+    for(const s of stars){s.p+=s.s;const a=.35+.5*Math.abs(Math.sin(s.p));
+      ctx.beginPath();ctx.arc(s.x,s.y,s.r,0,6.28);ctx.fillStyle=`rgba(180,200,255,${a})`;ctx.fill();}
+    requestAnimationFrame(tick);}
+  tick();
+})();
+
+// ---------------------------------------------------------------- domain intro
+const DOMAIN_TXT = {gojo:["UNLIMITED VOID","infinite information \u00b7 binding vow"],
+  sukuna:["MALEVOLENT SHRINE","dismantle \u00b7 cleave \u00b7 reveal"],
+  cosmos:["ASMX \u03a9 DOMAIN","every byte, every cycle, observed"]};
+function playDomain(name){
+  const d=document.getElementById('domain');
+  document.getElementById('domtitle').textContent=DOMAIN_TXT[name][0];
+  document.getElementById('domsub').textContent=DOMAIN_TXT[name][1];
+  d.classList.remove('hide'); d.style.background = name==='sukuna' ? 'radial-gradient(circle,#2a0008,#000)' :
+    name==='gojo' ? 'radial-gradient(circle,#06111f,#000)' : 'radial-gradient(circle,#0a0820,#000)';
+  clearTimeout(window.__dht);
+  window.__dht=setTimeout(()=>d.classList.add('hide'), 1900);
+}
+document.querySelectorAll('[data-dom]').forEach(b=>b.addEventListener('click',()=>{
+  document.querySelectorAll('[data-dom]').forEach(x=>x.classList.remove('on')); b.classList.add('on');
+  playDomain(b.dataset.dom);
+}));
+setTimeout(()=>playDomain('cosmos'),80);
+
+// ---------------------------------------------------------------- data shaping
+const G = DATA.graph, META = DATA.meta, FIND = DATA.findings, EVENTS = DATA.events, SYS = DATA.syscalls;
+const TYPE_COLOR = {process:'#ffffff',thread:'#b388ff',function:'#7df9ff',block:'#4d6fff',instruction:'#4d6fff',
+  file:'#5dffb0',socket:'#5dffb0',syscall:'#ffd27a',heap_block:'#ff9fe0',finding:'#ff4d6d',library:'#6b72a8',
+  input_source:'#ff5fb0',struct:'#c9ffb0',stream:'#5dffb0'};
+const TYPE_SHAPE = {process:9,thread:7,function:6,block:3.5,file:6,socket:6,syscall:5,heap_block:5.5,finding:6,library:4,input_source:5,struct:4};
+
+document.getElementById('hdrmeta').textContent = META.summary;
+const sevCounts = {}; for(const f of FIND) sevCounts[f.sev]=(sevCounts[f.sev]||0)+1;
+document.getElementById('hdrsev').innerHTML = ['CRITICAL','HIGH','MEDIUM','LOW','INFO'].filter(s=>sevCounts[s])
+  .map(s=>`<span class="badge c-${s}">${sevCounts[s]} ${s}</span>`).join('');
+document.getElementById('fcount').textContent = FIND.length;
+document.getElementById('runmeta').textContent = META.run_meta;
+
+// ---------------------------------------------------------------- level / filter state
+const LEVELS = ['system','functions','dataflow'];
+let level='functions', focusFn=null;
+const levelBtns=document.getElementById('levelBtns');
+LEVELS.forEach(l=>{const b=document.createElement('button');b.textContent=l;b.className=l===level?'on':'';
+  b.onclick=()=>{level=l;focusFn=null;document.querySelectorAll('#levelBtns button').forEach(x=>x.classList.remove('on'));b.classList.add('on');renderGraph();};
+  levelBtns.appendChild(b);});
+
+const ALLTYPES = [...new Set(G.nodes.map(n=>n.type))];
+const hiddenTypes = new Set();
+const tt=document.getElementById('typeToggles');
+ALLTYPES.forEach(t=>{const row=document.createElement('div');row.className='row';
+  row.innerHTML=`<span><i style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${TYPE_COLOR[t]||'#888'};margin-right:6px"></i>${t}</span>`;
+  const btn=document.createElement('button'); btn.textContent='on'; btn.style.fontSize='10px'; btn.style.padding='1px 6px';
+  btn.onclick=()=>{if(hiddenTypes.has(t)){hiddenTypes.delete(t);btn.textContent='on';btn.classList.add('on');}else{hiddenTypes.add(t);btn.textContent='off';btn.classList.remove('on');} renderGraph();};
+  btn.className='on'; row.appendChild(btn); tt.appendChild(row);});
+
+document.getElementById('legend').innerHTML = Object.entries(TYPE_COLOR).slice(0,9).map(([k,v])=>`<div><i style="background:${v}"></i>${k}</div>`).join('');
+
+// ---------------------------------------------------------------- findings list
+const flist=document.getElementById('findingsList');
+FIND.slice(0,250).forEach((f,i)=>{const row=document.createElement('div');row.className='row';
+  row.innerHTML=`<span>${f.title.slice(0,34)}</span><span class="chip c-${f.sev}">${f.sev}</span>`;
+  row.onclick=()=>{showDetail(Object.assign({type:'finding'},f)); seekStep(f.step);};
+  flist.appendChild(row);});
+
+// ---------------------------------------------------------------- graph view (SVG, simple force layout)
+const svg=document.getElementById('svgwrap'); const tooltip=document.getElementById('tooltip'); const crumbs=document.getElementById('crumbs');
+let viewBox={x:0,y:0,w:1000,h:700}, panStart=null;
+function applyVB(){svg.setAttribute('viewBox',`${viewBox.x} ${viewBox.y} ${viewBox.w} ${viewBox.h}`);}
+svg.addEventListener('wheel',e=>{e.preventDefault();const f=e.deltaY>0?1.1:0.9;
+  const mx=viewBox.x+viewBox.w*(e.offsetX/svg.clientWidth), my=viewBox.y+viewBox.h*(e.offsetY/svg.clientHeight);
+  viewBox.w*=f; viewBox.h*=f; viewBox.x=mx-viewBox.w*(e.offsetX/svg.clientWidth); viewBox.y=my-viewBox.h*(e.offsetY/svg.clientHeight); applyVB();});
+svg.addEventListener('mousedown',e=>{panStart={x:e.clientX,y:e.clientY,vb:{...viewBox}};});
+addEventListener('mouseup',()=>panStart=null);
+addEventListener('mousemove',e=>{if(!panStart)return;const dx=(e.clientX-panStart.x)*viewBox.w/svg.clientWidth, dy=(e.clientY-panStart.y)*viewBox.h/svg.clientHeight;
+  viewBox.x=panStart.vb.x-dx; viewBox.y=panStart.vb.y-dy; applyVB();});
+
+function levelFilter(){
+  if(level==='system') return n=>['process','thread','library','file','socket','syscall'].includes(n.type);
+  if(level==='functions') return n=>['function','file','socket','syscall','heap_block','finding','input_source'].includes(n.type) && (!focusFn || n.id==='fn:'+focusFn || true);
+  return n=>['function','finding','input_source','heap_block'].includes(n.type);
+}
+let posCache={};
+function layout(nodes, edges){
+  const idx={}; nodes.forEach((n,i)=>idx[n.id]=i);
+  const n=nodes.length; if(!n) return {};
+  let pos = nodes.map(nd=>posCache[nd.id]||{x:(Math.random()-.5)*600,y:(Math.random()-.5)*600});
+  const deg=new Array(n).fill(0);
+  edges.forEach(e=>{if(idx[e.from]!=null)deg[idx[e.from]]++; if(idx[e.to]!=null)deg[idx[e.to]]++;});
+  const iters = n>120?70:140;
+  const k=900/Math.sqrt(n+1);
+  for(let it=0;it<iters;it++){
+    const disp=pos.map(()=>({x:0,y:0}));
+    for(let i=0;i<n;i++)for(let j=i+1;j<n;j++){
+      let dx=pos[i].x-pos[j].x, dy=pos[i].y-pos[j].y; let d=Math.hypot(dx,dy)||0.01;
+      const f=(k*k)/d; dx/=d;dy/=d;
+      disp[i].x+=dx*f; disp[i].y+=dy*f; disp[j].x-=dx*f; disp[j].y-=dy*f;
+    }
+    edges.forEach(e=>{const i=idx[e.from],j=idx[e.to]; if(i==null||j==null)return;
+      let dx=pos[i].x-pos[j].x, dy=pos[i].y-pos[j].y; let d=Math.hypot(dx,dy)||0.01;
+      const f=(d*d)/k; dx/=d;dy/=d;
+      disp[i].x-=dx*f; disp[i].y-=dy*f; disp[j].x+=dx*f; disp[j].y+=dy*f;});
+    const temp=30*(1-it/iters)+1;
+    for(let i=0;i<n;i++){const d=Math.hypot(disp[i].x,disp[i].y)||0.01; const lim=Math.min(d,temp);
+      pos[i].x+=disp[i].x/d*lim; pos[i].y+=disp[i].y/d*lim;
+      pos[i].x=Math.max(-1200,Math.min(1200,pos[i].x)); pos[i].y=Math.max(-900,Math.min(900,pos[i].y));}
+  }
+  const out={}; nodes.forEach((nd,i)=>{out[nd.id]=pos[i]; posCache[nd.id]=pos[i];}); return out;
+}
+
+let curStep=0, curNodes=[], curEdges=[];
+function renderGraph(){
+  const f=levelFilter();
+  let nodes=G.nodes.filter(nd=>f(nd) && !hiddenTypes.has(nd.type));
+  const ids=new Set(nodes.map(n=>n.id));
+  let edges=G.edges.filter(e=>ids.has(e.from)&&ids.has(e.to));
+  if(level==='dataflow'){ edges=edges.filter(e=>e.type==='dataflow'||e.type==='taint'||e.type==='finds'); }
+  if(nodes.length>260){ nodes=[...nodes].sort((a,b)=>(b.steps||b.n||0)-(a.steps||a.n||0)).slice(0,260); const ids2=new Set(nodes.map(n=>n.id)); edges=edges.filter(e=>ids2.has(e.from)&&ids2.has(e.to)); }
+  curNodes=nodes; curEdges=edges;
+  const pos=layout(nodes,edges);
+  svg.innerHTML='';
+  const defs=document.createElementNS('http://www.w3.org/2000/svg','defs');
+  defs.innerHTML=`<marker id="arrow" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0L6,3L0,6Z" fill="#555a99"/></marker>`;
+  svg.appendChild(defs);
+  const eg=document.createElementNS('http://www.w3.org/2000/svg','g');
+  edges.forEach(e=>{const a=pos[e.from],b=pos[e.to]; if(!a||!b)return;
+    const ln=document.createElementNS('http://www.w3.org/2000/svg','line');
+    ln.setAttribute('x1',a.x);ln.setAttribute('y1',a.y);ln.setAttribute('x2',b.x);ln.setAttribute('y2',b.y);
+    const taint=e.type==='taint'||e.tainted; 
+    ln.setAttribute('stroke', taint?'#ff5fb0': e.type==='finds'?'#ff4d6d': '#555a9980');
+    ln.setAttribute('stroke-width', taint?1.6:1); ln.setAttribute('marker-end','url(#arrow)');
+    if(taint) ln.setAttribute('stroke-dasharray','3,3');
+    eg.appendChild(ln);});
+  svg.appendChild(eg);
+  const ng=document.createElementNS('http://www.w3.org/2000/svg','g');
+  nodes.forEach(nd=>{const p=pos[nd.id]; if(!p)return;
+    const g=document.createElementNS('http://www.w3.org/2000/svg','g'); g.setAttribute('transform',`translate(${p.x},${p.y})`); g.style.cursor='pointer';
+    const r=TYPE_SHAPE[nd.type]||4;
+    const c=document.createElementNS('http://www.w3.org/2000/svg','circle'); c.setAttribute('r',r);
+    let fill=TYPE_COLOR[nd.type]||'#8888bb';
+    if(nd.type==='finding') fill = {CRITICAL:'#ff2d55',HIGH:'#ff7a45',MEDIUM:'#ffd27a',LOW:'#5dffb0',INFO:'#6b72a8'}[nd.sev]||fill;
+    c.setAttribute('fill',fill); c.setAttribute('fill-opacity', nd.type==='finding'?'0.95':'0.85');
+    c.setAttribute('stroke', nd.type==='finding' ? '#fff' : fill); c.setAttribute('stroke-opacity','0.5');
+    g.appendChild(c);
+    const t=document.createElementNS('http://www.w3.org/2000/svg','text'); t.setAttribute('class','nlabel');
+    t.setAttribute('x',r+3); t.setAttribute('y',3); t.textContent=(nd.label||nd.id).toString().slice(0,26);
+    g.appendChild(t);
+    g.addEventListener('mouseenter',ev=>{tooltip.style.display='block'; tooltip.innerHTML=tipFor(nd);
+      const rect=svg.getBoundingClientRect(); tooltip.style.left=(ev.clientX-rect.left+14)+'px'; tooltip.style.top=(ev.clientY-rect.top+10)+'px';});
+    g.addEventListener('mouseleave',()=>tooltip.style.display='none');
+    g.addEventListener('click',()=>{ showDetail(nd);
+      if(nd.type==='function'&&level==='functions'){focusFn=nd.label; }
+    });
+    g.addEventListener('dblclick',()=>{ if(nd.type==='function'){level='dataflow';focusFn=nd.label;
+      document.querySelectorAll('#levelBtns button').forEach(x=>x.classList.toggle('on',x.textContent===level)); renderGraph();}});
+    ng.appendChild(g); nd.__pos=p;
+  });
+  svg.appendChild(ng);
+  viewBox={x:-650,y:-500,w:1300,h:1000}; applyVB();
+  crumbs.innerHTML = `<span onclick="level='system';focusFn=null;renderGraph();document.querySelectorAll('#levelBtns button').forEach(x=>x.classList.toggle('on',x.textContent==='system'))">system</span>`+
+    `<span onclick="level='functions';renderGraph();document.querySelectorAll('#levelBtns button').forEach(x=>x.classList.toggle('on',x.textContent==='functions'))">functions</span>` +
+    (focusFn? `<span>\u25b8 ${focusFn}</span>`:'');
+}
+function tipFor(nd){
+  let rows=`<b>${nd.label||nd.id}</b><br><span style="color:var(--dim)">${nd.type}</span>`;
+  if(nd.type==='function') rows+=`<br>steps: ${nd.steps||0} \u00b7 obj: ${nd.obj||''}` + (nd.compiler? `<br>compiler: ${nd.compiler.state}${nd.compiler.sites?(' \u00d7'+nd.compiler.sites):''}`:'') + (nd.tainted_args&&nd.tainted_args.length? `<br style="color:var(--pink)">tainted args: ${nd.tainted_args.join(',')}`:'');
+  if(nd.type==='finding') rows+=`<br>${nd.detail||''}`;
+  if(nd.type==='heap_block') rows+=`<br>size ${nd.size}B \u00b7 ${nd.state}`;
+  if(nd.type==='syscall'||nd.type==='file'||nd.type==='socket') rows+=`<br>n=${nd.n||''} reads=${nd.reads||''} writes=${nd.writes||''}`;
+  return rows;
+}
+function showDetail(nd){
+  const d=document.getElementById('detail'); let h=`<div style="color:var(--accent);font-weight:700">${nd.label||nd.title||nd.id}</div>`;
+  h+=`<div style="color:var(--dim);margin:4px 0">${nd.type||nd.kind||''}</div>`;
+  if(nd.detail) h+=`<pre>${esc(nd.detail)}</pre>`;
+  if(nd.witness && nd.witness.input_bytes && Object.keys(nd.witness.input_bytes).length)
+    h+=`<div>witness bytes: ${Object.entries(nd.witness.input_bytes).map(([k,v])=>`<b>${k}</b>[${v}]`).join(', ')}</div>`;
+  if(nd.compiler) h+=`<div>compiler: ${nd.compiler.state} (${nd.compiler.sites||0} call sites)</div>`;
+  if(nd.members) h+=`<pre>${nd.members.map(m=>`+${m.off.toString().padStart(3)}  ${m.type} ${m.name};`).join('\n')}</pre>`;
+  d.innerHTML=h;
+}
+function esc(s){return (s+'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+renderGraph();
+
+// ---------------------------------------------------------------- search
+const search=document.getElementById('search'), sres=document.getElementById('searchResults');
+search.addEventListener('input',()=>{const q=search.value.toLowerCase(); sres.innerHTML='';
+  if(q.length<2) return;
+  G.nodes.filter(n=>(n.label||'').toLowerCase().includes(q)).slice(0,30).forEach(n=>{
+    const row=document.createElement('div'); row.className='row'; row.textContent=n.label+' ('+n.type+')';
+    row.onclick=()=>{showDetail(n); const p=n.__pos; if(p){viewBox.x=p.x-150;viewBox.y=p.y-100;viewBox.w=300;viewBox.h=220;applyVB();}};
+    sres.appendChild(row);});
+});
+
+// ---------------------------------------------------------------- timeline + playback
+const tlc=document.getElementById('tl-canvas'); const tlx=tlc.getContext('2d');
+function sizeTl(){tlc.width=tlc.clientWidth*2;tlc.height=tlc.clientHeight*2;tlx.scale(2,2);}
+sizeTl();
+const maxStep = META.total_steps||EVENTS.length;
+document.getElementById('scrub').max=maxStep;
+function drawTimeline(){
+  const w=tlc.clientWidth,h=tlc.clientHeight; tlx.clearRect(0,0,w,h);
+  tlx.fillStyle='#0a0c1e'; tlx.fillRect(0,0,w,h);
+  const fnColor={}; let ci=0; const palette=['#7df9ff','#ff5fb0','#ffd27a','#5dffb0','#b388ff','#ff9f6b','#6ee7ff'];
+  EVENTS.forEach(e=>{ if(e.fn && !(e.fn in fnColor)){fnColor[e.fn]=palette[ci++%palette.length];} });
+  const n=EVENTS.length||1;
+  EVENTS.forEach((e,i)=>{ const x=(i/n)*w;
+    if(e.t==='i'||e.t==='s'){ tlx.fillStyle=fnColor[e.fn]||'#4d6fff'; tlx.fillRect(x,h*0.35,Math.max(1,w/n),h*0.4);} });
+  SYS.forEach(s=>{ const i=s.step/((META.total_steps)||1)*n; const x=(i/n)*w; tlx.fillStyle='#ffd27a'; tlx.fillRect(x,h*0.1,1.4,h*0.25);});
+  FIND.forEach(f=>{ const i=(f.step/((META.total_steps)||1))*n; const x=(i/n)*w; tlx.fillStyle='#ff4d6d'; tlx.fillRect(x,h*0.78,2,h*0.22);});
+  const cx=(curStep/maxStep)*w; tlx.strokeStyle='#fff'; tlx.lineWidth=1.5; tlx.beginPath();tlx.moveTo(cx,0);tlx.lineTo(cx,h);tlx.stroke();
+}
+drawTimeline(); addEventListener('resize',()=>{sizeTl();drawTimeline();});
+tlc.addEventListener('click',e=>{const r=tlc.getBoundingClientRect(); seekStep(Math.round((e.clientX-r.left)/r.width*maxStep));});
+
+function nearestEvent(step){
+  let lo=0,hi=EVENTS.length-1,best=EVENTS[0];
+  while(lo<=hi){const m=(lo+hi)>>1; const s=EVENTS[m].s;
+    if(s===step)return EVENTS[m]; if(s<step){best=EVENTS[m];lo=m+1;}else hi=m-1;}
+  return best;
+}
+function seekStep(step){
+  curStep=Math.max(0,Math.min(maxStep,step));
+  document.getElementById('scrub').value=curStep;
+  document.getElementById('stepLabel').textContent=`step ${curStep} / ${maxStep}`;
+  const ev=nearestEvent(curStep); if(!ev) return;
+  let h='';
+  if(ev.t==='i'){ h+=`<div class="mono" style="color:var(--accent)">${ev.fn}</div><div class="asmline cur">${ev.rip?.toString(16)?('0x'+ev.rip.toString(16)):''}  ${esc(ev.asm||'')}</div>`;
+    if(ev.chg&&Object.keys(ev.chg).length) h+=`<div>changed: ${Object.entries(ev.chg).map(([k,v])=>`${k}=${v[1].toString?v[1].toString(16):v[1]}`).join(', ')}</div>`;
+    if(ev.mem&&ev.mem.length) h+=`<div>mem: ${ev.mem.map(m=>`${m[0]} *${m[1].toString(16)} (${m[2]}B)=${m[3]}`).join('; ')}</div>`;
+    if(ev.var&&ev.var.length) h+=`<div>var: ${ev.var.join(', ')}</div>`;
+  } else if(ev.t==='s'){ h+=`<div class="mono" style="color:var(--dim)">running in <b>${ev.fn}</b> (${ev.obj}) \u00d7${ev.n} steps</div>`; }
+  else if(ev.t==='y'){ h+=`<div style="color:var(--gold)">${esc(ev.text)}</div>`; }
+  else if(ev.t==='h'){ h+=`<div style="color:var(--purple)">${esc(ev.text)}</div>`; }
+  document.getElementById('detail').innerHTML = h + document.getElementById('detail').innerHTML;
+  drawTimeline();
+  if(ev.fn){ const nid='fn:'+ev.fn; const nd=curNodes.find(n=>n.id===nid);
+    if(nd && nd.__pos){ highlightPulse(nd.__pos); } }
+}
+function highlightPulse(p){
+  const c=document.createElementNS('http://www.w3.org/2000/svg','circle');
+  c.setAttribute('cx',p.x);c.setAttribute('cy',p.y);c.setAttribute('r',4);c.setAttribute('fill','none');
+  c.setAttribute('stroke','#fff');c.setAttribute('class','flowpulse');c.setAttribute('stroke-width','2');
+  svg.appendChild(c);
+  let r=4; const anim=setInterval(()=>{r+=3;c.setAttribute('r',r);c.setAttribute('opacity',Math.max(0,1-r/40));
+    if(r>40){clearInterval(anim);c.remove();}},16);
+}
+document.getElementById('scrub').addEventListener('input',e=>seekStep(+e.target.value));
+let playing=false, playTimer=null;
+document.getElementById('playpause').addEventListener('click',()=>{
+  playing=!playing; document.getElementById('playpause').textContent = playing?'\u23f8':'\u25b6';
+  if(playing) tickPlay();
+});
+function tickPlay(){ if(!playing) return;
+  const speed = +document.getElementById('speed').value;
+  seekStep(curStep + Math.max(1, Math.round(maxStep/400)));
+  if(curStep>=maxStep){playing=false; document.getElementById('playpause').textContent='\u25b6'; return;}
+  playTimer=setTimeout(tickPlay, 16*speed);
+}
+seekStep(0);
+
+// ---------------------------------------------------------------- export
+function dl(name,content,type){const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([content],{type})); a.download=name; a.click();}
+document.getElementById('expjson').onclick=()=>dl('asmx_omni_graph.json',JSON.stringify(G,null,1),'application/json');
+document.getElementById('expdot').onclick=()=>dl('asmx_omni_graph.dot',DATA.dot||'','text/vnd.graphviz');
+document.getElementById('exphtml').onclick=()=>dl('asmx_omni_report.html',document.documentElement.outerHTML,'text/html');
+"""
+
+
+# =========================================================================== #
+#  CLI                                                                        #
+# =========================================================================== #
+def human(n):
+    for u in ("", "K", "M", "G"):
+        if abs(n) < 1024:
+            return f"{n:.0f}{u}"
+        n /= 1024
+    return f"{n:.0f}T"
+
+
+def run_one(args, src_or_bin, work: Path, tag="run"):
+    is_bin = sniff_bin(src_or_bin)
+    opt_info = {"decisions": {}, "missed": []}
+    stages = []
+    if is_bin:
+        exe = src_or_bin
+        rc, _, _ = sh(["chmod", "+x", str(exe)])
+    else:
+        src = Path(src_or_bin).resolve()
+        if not src.is_file():
+            raise OmniError(f"no such file: {src}")
+        cc = find_cc("c++" if src.suffix in (".cc", ".cpp", ".cxx") else "c", args.cc)
+        stages, exe, opt_info = build_pipeline(src, work, args.opt, cc, parse_flags_(args.flags), args.static)
+    info = BinInfo(exe, work)
+    argv = parse_flags_(args.args)
+    stdin_data = args.input.encode("latin1", "replace") if args.input is not None else (Path(args.stdin_file).read_bytes() if args.stdin_file else b"")
+    env = dict(os.environ)
+    env["PATH"] = env.get("PATH", "/usr/bin:/bin")
+    tr = Tracer(info, argv, env, stdin_data, args.max_steps, args.timeout, work, tag).run()
+    return info, tr, stages, opt_info
+
+
+def sniff_bin(path):
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+
+
+def parse_flags_(s):
+    return shlex.split(s) if s else []
+
+
+def summarize(tr: Tracer, info: BinInfo):
+    sev = Counter(f["sev"] for f in tr.findings)
+    bits = [f"{tr.steps} instr", f"{len(tr.syscalls)} syscalls", f"{len(tr.allocs)} allocs",
+            f"{len(tr.calls)} call-edges", human(len(tr.mem)) + " mem ops"]
+    if sev:
+        bits.append(" ".join(f"{sev[s]} {s}" for s in SEV if sev.get(s)))
+    return " \u00b7 ".join(bits)
+
+
+def render_report(tr: Tracer, info: BinInfo, opt_info, stages, src_name):
+    L = []
+    L.append(f"  asmx \u03a9  omni report  \u00b7  {Path(info.exe).name}")
+    L.append("  " + "\u2500" * 70)
+    if stages:
+        L.append("  build pipeline:")
+        for s in stages:
+            art = s["artifact"]
+            L.append(f"    {s['stage']:<10} {s['ms']:>5}ms  " + (f"{art['name']} ({human(art['bytes'])}B, sha256 {art['sha256']})" if art else "(no artifact)"))
+        for cat, items in opt_info["decisions"].items():
+            if items:
+                L.append(f"    {cat}: " + "; ".join(f"L{i['line']} {i['msg'][:60]}" for i in items[:4]) + (f"  (+{len(items)-4} more)" if len(items) > 4 else ""))
+        if opt_info["missed"]:
+            L.append("    missed: " + "; ".join(f"{m}x{n}" for m, n in opt_info["missed"]))
+    L.append(f"  binary: type={info.facts['type']} entry={hx(info.facts['entry'])} needed={','.join(info.facts['needed']) or '(static)'}")
+    if tr.plt_res:
+        L.append("  dynamic resolution: " + ", ".join(f"{k}→{v['resolved']}@{v['obj']}" for k, v in list(tr.plt_res.items())[:8]))
+    L.append("  " + "\u2500" * 70)
+    L.append("  execution: " + summarize(tr, info))
+    if tr.exit.get("truncated"):
+        L.append(f"  \u26a0 truncated: {tr.exit['truncated']}")
+    if tr.exit.get("signal"):
+        L.append(f"  process terminated by {tr.exit['signal']}")
+    elif tr.exit.get("code") is not None:
+        L.append(f"  process exited with code {tr.exit['code']}")
+    if tr.output:
+        L.append("  stdout: " + repr(tr.output[:300]))
+    L.append("  " + "\u2500" * 70)
+    L.append("  call graph (top call counts):")
+    for ln in call_graph_text(tr)[:30]:
+        L.append("    " + ln)
+    if tr.findings:
+        L.append("  " + "\u2500" * 70)
+        L.append(f"  findings ({len(tr.findings)}):")
+        for f in sorted(tr.findings, key=lambda f: SEV.index(f["sev"]))[:40]:
+            w = f["witness"]["input_bytes"]
+            wit = ("  witness: " + ", ".join(f"{k}[{v}]" for k, v in w.items())) if w else ""
+            L.append(f"    [{f['sev']:<8}] {f['title']}")
+            L.append(f"               {f['detail']}{wit}")
+    if tr.constraints:
+        L.append("  " + "\u2500" * 70)
+        L.append("  path constraints (symbolic):")
+        for c in tr.constraints[:20]:
+            L.append(f"    {tr.symof(c['rip'])[0]:<16} {c['text']}" + (f"  (x{c['n']})" if c["n"] > 1 else ""))
+    if info.dwarf.structs:
+        L.append("  " + "\u2500" * 70)
+        L.append("  structures (DWARF):")
+        for s in info.dwarf.structs[:12]:
+            L.append(f"    {s['kind']} {s['name']}  ({s['size']}B)")
+            for m in s["members"][:10]:
+                L.append(f"      +{m['off']:<3} {m['type']} {m['name']};")
+    return "\n".join(L) + "\n"
+
+
+def make_html(tr: Tracer, info: BinInfo, graph, title):
+    ev = []
+    for e in tr.events:
+        d = {"t": e["t"], "s": e["s"]}
+        if e["t"] == "i":
+            d.update(rip=e["rip"], asm=e["asm"], fn=e["fn"], chg=e["chg"], mem=e["mem"], var=e.get("var", []))
+        elif e["t"] == "s":
+            d.update(fn=e["fn"], obj=e.get("obj", ""), n=e["n"])
+        elif e["t"] == "y":
+            d.update(text=e["text"])
+        elif e["t"] == "h":
+            d.update(text=e["text"])
+        ev.append(d)
+    findings = [{"sev": f["sev"], "kind": f["kind"], "title": f["title"], "detail": f["detail"], "step": f["step"], "witness": f["witness"]} for f in tr.findings]
+    data = {
+        "graph": graph,
+        "events": ev,
+        "findings": findings,
+        "syscalls": [{"step": s["step"], "name": s["name"], "text": s["text"]} for s in tr.syscalls],
+        "dot": to_dot(graph),
+        "meta": {"summary": summarize(tr, info), "total_steps": tr.steps,
+                 "run_meta": f"exit={tr.exit} \u00b7 {Path(info.exe).name}"},
+    }
+    js = json.dumps(data, separators=(",", ":"))
+    html = HTML_TEMPLATE.replace("__TITLE__", title).replace("__META__", summarize(tr, info)).replace("__DATA_JSON__", js).replace("__APP_JS__", APP_JS)
+    return html
+
+
+def omni_main(argv=None):
+    ap = argparse.ArgumentParser(prog="asmx-omni", description="whole-program / whole-run analysis engine for asmx",
+                                 epilog="examples:\n  asmx_omni.py prog.c -O1 --input 'AAAA...' --html out.html\n"
+                                 "  asmx_omni.py ./a.out --args '-x 3' --stdin-file in.bin --json out.json\n"
+                                 "  asmx_omni.py prog.c --diff-against goodinput.c --html diff.html\n",
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("file", help="C/C++ source file or an existing ELF binary")
+    ap.add_argument("-O", dest="opt", default="0", choices=("0", "1", "2", "3", "s"))
+    ap.add_argument("--cc", help="compiler override")
+    ap.add_argument("--flags", default="", help="extra compiler flags")
+    ap.add_argument("--static", action="store_true", help="link statically (simplifies the library graph)")
+    ap.add_argument("--args", default="", help="argv passed to the target, shlex-quoted")
+    ap.add_argument("--input", help="literal bytes piped to stdin (supports \\n, \\x41 escapes)")
+    ap.add_argument("--stdin-file", help="file whose bytes are piped to stdin")
+    ap.add_argument("--max-steps", type=int, default=400000, help="instruction budget (default 400000)")
+    ap.add_argument("--timeout", type=int, default=25, help="wall-clock seconds for the run (default 25)")
+    ap.add_argument("--html", help="write the animated graph/timeline UI here")
+    ap.add_argument("--json", help="write the raw typed graph + events as JSON")
+    ap.add_argument("--dot", help="write the call/data graph as Graphviz DOT")
+    ap.add_argument("-o", "--output", help="write the text report here instead of stdout")
+    ap.add_argument("--quiet", "-q", action="store_true")
+    ap.add_argument("--diff-against", metavar="FILE", help="build/run a second target with the same --args/--input and report where the two runs diverge")
+    args = ap.parse_args(argv)
+    if args.input is not None:
+        args.input = codecs.escape_decode(args.input.encode())[0].decode("latin1")
+
+    with tempfile.TemporaryDirectory(prefix="asmx-omni-") as tmp:
+        work = Path(tmp)
+        try:
+            info, tr, stages, oi = run_one(args, args.file, work, "a")
+        except OmniError as e:
+            print(f"\u2716 {e}", file=sys.stderr)
+            if e.hint:
+                print(e.hint, file=sys.stderr)
+            return 1
+        graph, blocks, bedges = build_graph(tr, info, Path(args.file).name)
+        report = render_report(tr, info, oi, stages, Path(args.file).name)
+        if not args.quiet:
+            sys.stderr.write(f"  \u25b8 recorded {tr.steps} instructions, {len(tr.syscalls)} syscalls, {len(tr.findings)} findings\n")
+
+        diff = None
+        if args.diff_against:
+            info2, tr2, _, _ = run_one(args, args.diff_against, work, "b")
+            diff = diff_runs(tr, tr2)
+            report += "\n  " + "\u2500" * 70 + "\n  diff vs " + args.diff_against + ":\n"
+            if diff["diverged_at_step"] is None:
+                report += "    runs matched for the entire common prefix\n"
+            else:
+                report += f"    first instruction divergence at step {diff['diverged_at_step']}\n"
+                for w in diff["window"]:
+                    mark = " <<<" if w["step"] == diff["diverged_at_step"] else ""
+                    report += f"      step {w['step']:<6} a:{w['sym_a']}@{w['a']}  b:{w['sym_b']}@{w['b']}{mark}\n"
+            if diff["syscalls_a_tail"] != diff["syscalls_b_tail"]:
+                report += "    syscalls diverge:\n      a: " + " | ".join(diff["syscalls_a_tail"]) + "\n      b: " + " | ".join(diff["syscalls_b_tail"]) + "\n"
+            if diff["findings_only_a"] or diff["findings_only_b"]:
+                report += f"    findings only in A: {diff['findings_only_a']}\n    findings only in B: {diff['findings_only_b']}\n"
+
+        if args.output:
+            Path(args.output).write_text(report)
+        else:
+            sys.stdout.write(report)
+        if args.json:
+            Path(args.json).write_text(json.dumps({"graph": graph, "findings": tr.findings, "syscalls": tr.syscalls,
+                                                    "diff": diff}, indent=1, default=str))
+        if args.dot:
+            Path(args.dot).write_text(to_dot(graph))
+        if args.html:
+            Path(args.html).write_text(make_html(tr, info, graph, Path(args.file).name))
+            if not args.quiet:
+                sys.stderr.write(f"  \u25b8 wrote {args.html}\n")
+    return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -3057,6 +5483,16 @@ def parse_args(argv):
                     help="animated sci-fi control-flow graph (with --trace: replays the real path)")
     ap.add_argument("--xray", action="store_true",
                     help="deepest low-level view: effects, stack frame, call args, vulnerability audit (x86-64)")
+    ap.add_argument("--omni", action="store_true",
+                    help="whole-program/whole-run engine: real ptrace recording, syscalls, heap, taint, "
+                         "symbolic constraints, DWARF structs, call graph -> animated graph+timeline")
+    ap.add_argument("--omni-html", metavar="FILE", help="--omni: write the animated graph/timeline UI here")
+    ap.add_argument("--omni-json", metavar="FILE", help="--omni: write the raw typed graph+events as JSON")
+    ap.add_argument("--omni-dot", metavar="FILE", help="--omni: write the call/data graph as Graphviz DOT")
+    ap.add_argument("--omni-input", metavar="BYTES", help="--omni: literal stdin for the recorded run (\\n, \\x41 escapes)")
+    ap.add_argument("--omni-stdin-file", metavar="FILE", help="--omni: file of bytes piped to stdin for the recorded run")
+    ap.add_argument("--omni-diff-against", metavar="FILE", help="--omni: build/run a second target and report where it diverges")
+    ap.add_argument("--omni-max-steps", type=int, default=400000, help="--omni: instruction budget (default 400000)")
     ap.add_argument("--domain", choices=tuple(DOMAINS), default="cyber",
                     help="visual theme: cyber matrix gojo sukuna (gojo/sukuna play a domain-expansion intro)")
     ap.add_argument("--no-anim", action="store_true", help="skip intro/animation, print static frames only")
@@ -3093,6 +5529,21 @@ def build(args, lang, path, text, workdir, opt) -> tuple[list[Item], str, str]:
 
 
 def run_cli(args, err: Painter) -> int:
+    if args.omni:
+        omni_argv = [args.file, "-O", args.opt]
+        if args.cc: omni_argv += ["--cc", args.cc]
+        if args.flags: omni_argv += ["--flags", args.flags]
+        if args.args: omni_argv += ["--args", args.args]
+        if args.omni_input is not None: omni_argv += ["--input", args.omni_input]
+        if args.omni_stdin_file: omni_argv += ["--stdin-file", args.omni_stdin_file]
+        if args.omni_diff_against: omni_argv += ["--diff-against", args.omni_diff_against]
+        omni_argv += ["--max-steps", str(args.omni_max_steps), "--timeout", str(args.timeout)]
+        if args.omni_html: omni_argv += ["--html", args.omni_html]
+        if args.omni_json: omni_argv += ["--json", args.omni_json]
+        if args.omni_dot: omni_argv += ["--dot", args.omni_dot]
+        if args.output: omni_argv += ["-o", args.output]
+        if args.quiet: omni_argv += ["--quiet"]
+        return omni_main(omni_argv)
     path: Path | None = None
     text = ""
     if args.file == "-":
