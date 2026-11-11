@@ -10,6 +10,13 @@ and adds source mapping, noise filtering, demangling, highlighting and a dynamic
 - `--sweep`: compare instruction counts across `-O0` to `-Os`
 - Pure Python standard library, no pip installs
 
+well now we have a beautiful graph representation, it looks so appealing. 
+## you can run :
+
+**python3 Code2Asmx.py Tests/test.cpp --graph -f main -O0 --domain gojo**
+
+**python3 asmx.py Tests/test.cpp --graph --trace -f main -O0 --steps 600**
+
 > **Warning:** `--trace` really executes the target. Only trace code you trust, and only
 > analyse software you are authorised to test.
 
@@ -133,3 +140,185 @@ technotheos@HP-EliteBook-840-G8-PC:~/CodeToAssembly\$ python3 Code2Asmx.py ../Te
   0027  0x401303  66 c7 44 24 12 1f 90     mov     WORD PTR [rsp+0x12], 0x901f
   ▍  47 │ if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
 ```
+
+**```python3 asmx.py Tests/test.cpp --graph --trace -f main -O0 --steps 600``` command execution example :**
+
+**I don't think it will look better here, so make sure to run it and see it with your eyes, it is really magnificent and gorgeous to look at.**
+
+technotheos@HP-EliteBook-840-G8-PC:~$ python3 asmx.py Tests/test.cpp --graph --trace -f main -O0 --steps 600
+  ▄▀█ █▀ █▀▄▀█ ▀▄▀
+  █▀█ ▄█ █░▀░█ █░█
+  source ⟶ assembly  //  v2.0.0
+
+  ▸ running the target under gdb (it really executes)
+ ◢◤ NEURAL LINK ─ ƒ main  27 blocks · 38 edges · 2 loops                                                                                           
+                                                                                                                                                   
+                                                                                                                                                   
+                                                                                                                                                   
+                                                ┏━ B0 ▶ main ━━━━━━━━━━━━┓                                                                         
+                                                ┃  27│ int main() {      ┃                                                                         
+                                                ┃ push   rbp             ┃                                                                         
+                                                ┃ mov    rbp, rsp        ┃                                                                         
+                                                ┃ sub    rsp, 0x450      ┃                                                                         
+                                                ┃ mov    rax, QWORD PTR… ┃                                                                         
+                                                ┃ ⋮ +8 more              ┃                                                                         
+                                                ┃ jns    → B2            ┃                                                                         
+                                                ┗━━━━━━━━┳━━━━━━┳━━━━━━━━┛                                                                         
+                                              ╭──────────╯      │                                                                                  
+                                              │                 ╰───────────╮                                                                      
+                                              ▼                             ▼                                                                      
+                                 ┏━ B2 0x4012ef ━━━━━━━━━━┓    ┏━ B1 0x4012db ━━━━━━━━━━┓                                                          
+                                 ┃  35│ int opt = 1;      ┃    ┃  30│ perror("socket f… ┃                                                          
+                                 ┃ mov    DWORD PTR [rbp… ┃    ┃ mov    edi, 0x40202a   ┃                                                          
+                                 ┃ lea    rdx, [rbp-0x45… ┃    ┃ call   perror          ┃                                                          
+                                 ┃ mov    eax, DWORD PTR… ┃    ┃ mov    eax, 0x1        ┃                                                          
+                                 ┃ mov    r8d, 0x4        ┃    ┃ jmp    → B24           ┃                                                          
+                                 ┃ ⋮ +7 more              ┃    ┗━━━━━━━━━━━━┳━━━━━━━━━━━┛                                                          
+                                 ┃ je     → B4            ┃                 │                                                                      
+                                 ┗━━━━━━━━┳━━━━━━┳━━━━━━━━┛                 │                                                                      
+                                          │      │                          ╰────────────────────────────────────────────────────────────────╮     
+                                          ╰───╮  │                                                                                           │     
+                                              │  ╰──────────────────────────╮                                                                │     
+                                              ▼                             ▼                                                                │     
+                                 ┏━ B4 0x401348 ━━━━━━━━━━┓    ┏━ B3 0x401327 ━━━━━━━━━━┓                                                    │     
+                                 ┃  42│ sockaddr_in addr… ┃    ┃  37│ perror("setsocko… ┃                                                    │     
+                                 ┃ mov    QWORD PTR [rbp… ┃    ┃ mov    edi, 0x402038   ┃                                                    │     
+                                 ┃ mov    QWORD PTR [rbp… ┃    ┃ call   perror          ┃                                                    │     
+                                 ┃ mov    WORD PTR [rbp-… ┃    ┃ mov    eax, DWORD PTR… ┃                                                    │     
+                                 ┃ mov    DWORD PTR [rbp… ┃    ┃ mov    edi, eax        ┃                                                    │     
+                                 ┃ ⋮ +11 more             ┃    ┃ ⋮ +2 more              ┃                                                    │     
+                                 ┃ je     → B6            ┃    ┃ jmp    → B24           ┃                                                    │     
+                                 ┗━━━━━━━━┳━━━━━━┳━━━━━━━━┛    ┗━━━━━━━━━━━━┳━━━━━━━━━━━┛                                                    │     
+                                          │      │                          ╰──────────────────────────────────────────────────────────────╮ │     
+                                          ╰───╮  │                                                                                         │ │     
+                                              │  ╰──────────────────────────╮                                                              │ │     
+                                              ▼                             ▼                                                              │ │     
+                                 ┏━ B6 0x4013c6 ━━━━━━━━━━┓    ┏━ B5 0x4013a5 ━━━━━━━━━━┓                                                  │ │     
+                                 ┃  53│ if (listen(serve… ┃    ┃  48│ perror("bind fai… ┃                                                  │ │     
+                                 ┃ mov    eax, DWORD PTR… ┃    ┃ mov    edi, 0x40204a   ┃                                                  │ │     
+                                 ┃ mov    esi, 0x1000     ┃    ┃ call   perror          ┃                                                  │ │     
+                                 ┃ mov    edi, eax        ┃    ┃ mov    eax, DWORD PTR… ┃                                                  │ │     
+                                 ┃ call   listen          ┃    ┃ mov    edi, eax        ┃                                                  │ │     
+                                 ┃ ⋮ +2 more              ┃    ┃ ⋮ +2 more              ┃                                                  │ │     
+                                 ┃ je     → B8            ┃    ┃ jmp    → B24           ┃                                                  │ │     
+                                 ┗━━━━━━━━┳━━━━━━┳━━━━━━━━┛    ┗━━━━━━━━━━━━┳━━━━━━━━━━━┛                                                  │ │     
+                                          │      │                          ╰──────────────────────────────────────────────────────────╮   │ │     
+                                          ╰───╮  │                                                                                     │   │ │     
+                                              │  ╰──────────────────────────╮                                                          │   │ │     
+                                              ▼                             ▼                                                          │   │ │     
+                                 ┏━ B8 0x401400 ━━━━━━━━━━┓    ┏━ B7 0x4013df ━━━━━━━━━━┓                                              │   │ │     
+                                 ┃  59│ make_non_blockin… ┃    ┃  54│ perror("listen f… ┃                                              │   │ │     
+                                 ┃ mov    eax, DWORD PTR… ┃    ┃ mov    edi, 0x402056   ┃                                              │   │ │     
+                                 ┃ mov    edi, eax        ┃    ┃ call   perror          ┃                                              │   │ │     
+                                 ┃ call   make_non_block… ┃    ┃ mov    eax, DWORD PTR… ┃                                              │   │ │     
+                                 ┃ mov    esi, 0x402064   ┃    ┃ mov    edi, eax        ┃                                              │   │ │     
+                                 ┃ ⋮ +7 more              ┃    ┃ ⋮ +2 more              ┃                                              │   │ │     
+                                 ┃ call   std::basic_ost… ┃    ┃ jmp    → B24           ┃                                              │   │ │     
+                                 ┗━━━━━━━━━━━━┳━━━━━━━━━━━┛    ┗━━━━━━━━━━━━┳━━━━━━━━━━━┛                                              │   │ │     
+                                              │                             ╰────────────────────────────────────────────────────────╮ │   │ │     
+                                              ╰────────╮                                                                             │ │   │ │     
+                                                       │     ╭───────────────────────────────────────────────────────────────────╮   │ │   │ │     
+                                                       │     │    ╭──────────────────────────────────────────────────────────────┼───┼─┼─╮ │ │     
+                                                       ▼     ▼    ▼                                                              │   │ │ │ │ │     
+                                                ┏━ B9 ↻ 0x401436━━━━━━━━━┓                                                       │   │ │ │ │ │     
+                                                ┃  63│ sockaddr_in clie… ┃                                                       │   │ │ │ │ │     
+                                                ┃ mov    QWORD PTR [rbp… ┃                                                       │   │ │ │ │ │     
+                                                ┃ mov    QWORD PTR [rbp… ┃                                                       │   │ │ │ │ │     
+                                                ┃ mov    DWORD PTR [rbp… ┃                                                       │   │ │ │ │ │     
+                                                ┃ lea    rdx, [rbp-0x44… ┃                                                       │   │ │ │ │ │     
+                                                ┃ ⋮ +7 more              ┃                                                       │   │ │ │ │ │     
+                                                ┃ jns    → B14           ┃                                                       │   │ │ │ │ │     
+                                                ┗━━━━━━━━┳━━━━━━┳━━━━━━━━┛                                                       │   │ │ │ │ │     
+                                                         │      ╰───────────╮                                                    │   │ │ │ │ │     
+                                              ╭──────────╯                  │                                                    │   │ │ │ │ │     
+                                              ▼                             ▼                                                    │   │ │ │ │ │     
+                                 ┏━ B10 0x401483 ━━━━━━━━━┓    ┏━ B14 0x4014c8 ━━━━━━━━━┓                                        │   │ │ │ │ │     
+                                 ┃  68│ if (errno == EWO… ┃    ┃  78│ make_non_blockin… ┃                                        │   │ │ │ │ │     
+                                 ┃ call   __errno_locati… ┃    ┃ mov    eax, DWORD PTR… ┃                                        │   │ │ │ │ │     
+                                 ┃ mov    eax, DWORD PTR… ┃    ┃ mov    edi, eax        ┃                                        │   │ │ │ │ │     
+                                 ┃ cmp    eax, 0xb        ┃    ┃ call   make_non_block… ┃                                        │   │ │ │ │ │     
+                                 ┃ je     → B12           ┃    ┃ mov    esi, 0x402091   ┃                                        │   │ │ │ │ │     
+                                 ┗━━━━━━━━┳━━━━━━┳━━━━━━━━┛    ┃ mov    edi, 0x4040c0   ┃                                        │   │ │ │ │ │     
+                                          │      │             ┃ call   std::basic_ost… ┃                                        │   │ │ │ │ │     
+                                          │      │             ┗━━━━━━━━━━━━┳━━━━━━━━━━━┛                                        │   │ │ │ │ │     
+                                          │      ╰──────────────────────────┼────────────────────────────────────────────╮       │   │ │ │ │ │     
+                                          ╰───╮                             │                                            │       │   │ │ │ │ │     
+                                              │                         ╭───╯                                            │       │   │ │ │ │ │     
+                                              │                         │      ╭─────────────────────────────────────────┼─────╮ │   │ │ │ │ │     
+                                              ▼                         ▼      ▼                                         │     │ │   │ │ │ │ │     
+                                 ┏━ B11 0x40148f ━━━━━━━━━┓    ┏━ B15 ↻ 0x4014e━━━━━━━━━┓                                │     │ │   │ │ │ │ │     
+                                 ┃  68│ if (errno == EWO… ┃    ┃  83│ ssize_t bytes_re… ┃                                │     │ │   │ │ │ │ │     
+                                 ┃ call   __errno_locati… ┃    ┃ lea    rsi, [rbp-0x41… ┃                                │     │ │   │ │ │ │ │     
+                                 ┃ mov    eax, DWORD PTR… ┃    ┃ mov    eax, DWORD PTR… ┃                                │     │ │   │ │ │ │ │     
+                                 ┃ cmp    eax, 0xb        ┃    ┃ mov    ecx, 0x0        ┃                                │     │ │   │ │ │ │ │     
+                                 ┃ jne    → B13           ┃    ┃ mov    edx, 0x400      ┃                                │     │ │   │ │ │ │ │     
+                                 ┗━━━━━━━━┳━━━━━━┳━━━━━━━━┛    ┃ ⋮ +4 more              ┃                                │     │ │   │ │ │ │ │     
+                                          │      │             ┃ jns    → B19           ┃                                │     │ │   │ │ │ │ │     
+                                          │      │             ┗━━━━━━━━┳━━━━━━┳━━━━━━━━┛                                │     │ │   │ │ │ │ │     
+                   ╭──────────────────────┼──────┼──────────────────────┼──────┼─────────────────────────────────────────╯     │ │   │ │ │ │ │     
+                   │                      │      ╰──────────────────────┼──────┼──────────────────────────╮                    │ │   │ │ │ │ │     
+            ╭──────┼──────────────────────╯                             │      │                          │                    │ │   │ │ │ │ │     
+            │      │                                                    │   ╭──╯                          │                    │ │   │ │ │ │ │     
+            │      │                          ╭─────────────────────────╯   │                             │                    │ │   │ │ │ │ │     
+            ▼      ▼                          ▼                             ▼                             ▼                    │ │   │ │ │ │ │     
+   ┏━ B12 0x40149b ━━━━━━━━━┓    ┏━ B16 0x401513 ━━━━━━━━━┓    ┏━ B19 0x401537 ━━━━━━━━━┓    ┏━ B13 0x4014a7 ━━━━━━━━━┓        │ │   │ │ │ │ │     
+   ┃  70│ usleep(100000); … ┃    ┃  85│ if (errno == EWO… ┃    ┃  92│ } else if (bytes… ┃    ┃  73│ perror("accept f… ┃        │ │   │ │ │ │ │     
+   ┃ mov    edi, 0x186a0    ┃    ┃ call   __errno_locati… ┃    ┃ cmp    QWORD PTR [rbp… ┃    ┃ mov    edi, 0x402083   ┃        │ │   │ │ │ │ │     
+   ┃ call   usleep          ┃    ┃ mov    eax, DWORD PTR… ┃    ┃ jne    → B21           ┃    ┃ call   perror          ┃        │ │   │ │ │ │ │     
+   ┃ jmp    → B9            ┃    ┃ cmp    eax, 0xb        ┃    ┗━━━━━━━━┳━━━━━━┳━━━━━━━━┛    ┃ mov    eax, DWORD PTR… ┃        │ │   │ │ │ │ │     
+   ┗━━━━━━━━━━━━┳━━━━━━━━━━━┛    ┃ je     → B23           ┃             │      │             ┃ mov    edi, eax        ┃        │ │   │ │ │ │ │     
+                │                ┗━━━━━━━━┳━━━━━━┳━━━━━━━━┛             │      │             ┃ ⋮ +2 more              ┃        │ │   │ │ │ │ │     
+                │                         │      │                      │      │             ┃ jmp    → B24           ┃        │ │   │ │ │ │ │     
+                │                         │      │                      │      │             ┗━━━━━━━━━━━━┳━━━━━━━━━━━┛        │ │   │ │ │ │ │     
+                │                         │      │                      ├──────┼──────────────────────────┼────────────────────┼─┼───┼─┼─┼─┼─╯     
+                │                         │      │                      │   ╭──┼──────────────────────────┼────────────────────┼─┼───┼─┼─┼─╯       
+                │                         │      │                      │   │  ├──────────────────────────┼────────────────────┼─┼───┼─╯ │         
+                │                         │      │                      │   │  │   ╭──────────────────────┼────────────────────┼─┼───╯   │         
+                ╰─────────────────────────┼──────┼──────────────────────┼───┼──┼───┼──────────────────────┼────────────────────┼─╯       │         
+                                          │      │                  ╭───┼───┼──┼───┼──────────────────────╯                    │         │         
+                                          │      ╰──────────────────┼───┼───┼──┼───┼───────────────────────────────────────────┼───╮     │         
+                                          ╰───╮                     │   │   │  │   │                                           │   │     │         
+                                              │                     │   │   │  ├───┼──────────────────────╮                    │   │     │         
+                ╭─────────────────────────────┼─────────────────────┼───┤   │  │   │                      │                    │   │     │         
+                ▼                             ▼                     ▼   ▼   ▼  ▼   ▼                      ▼                    │   │     │         
+   ┏━ B20 0x401541 ━━━━━━━━━┓    ┏━ B17 0x40151f ━━━━━━━━━┓    ┏━ B24 0x4015a3 ━━━━━━━━━┓    ┏━ B21 0x401552 ━━━━━━━━━┓        │   │     │         
+   ┃  94│ std::cout << "Cl… ┃    ┃  85│ if (errno == EWO… ┃    ┃ 111│ }                 ┃    ┃  99│ ssize_t bytes_se… ┃        │   │     │         
+   ┃ mov    esi, 0x4020b3   ┃    ┃ call   __errno_locati… ┃    ┃ mov    rdx, QWORD PTR… ┃    ┃ mov    rdx, QWORD PTR… ┃        │   │     │         
+   ┃ mov    edi, 0x4040c0   ┃    ┃ mov    eax, DWORD PTR… ┃    ┃ sub    rdx, QWORD PTR… ┃    ┃ lea    rsi, [rbp-0x41… ┃        │   │     │         
+   ┃ call   std::basic_ost… ┃    ┃ cmp    eax, 0xb        ┃    ┃ je     → B26           ┃    ┃ mov    eax, DWORD PTR… ┃        │   │     │         
+   ┃ jmp    → B23           ┃    ┃ je     → B23           ┃    ┗━━━━━━━━┳━━━━━━┳━━━━━━━━┛    ┃ mov    ecx, 0x0        ┃        │   │     │         
+   ┗━━━━━━━━━━━━┳━━━━━━━━━━━┛    ┗━━━━━━━━┳━━━━━━┳━━━━━━━━┛             │      │             ┃ ⋮ +4 more              ┃        │   │     │         
+                │                         │      │                      │      │             ┃ jns    → B15           ┃        │   │     │         
+                │                         │      │                      │      │             ┗━━━━━━━━┳━━━━━━┳━━━━━━━━┛        │   │     │         
+                │                         │      ╰──────────────────────┼──────┼──────────────────────┼──────┼─────────────╮   │   │     │         
+                │                         ╰───╮                         │      │                      │      │             │   │   │     │         
+                ╰─────────────────────────────┼─────────────────────────┼──────┼──────────────────────┼──────┼─────────────┼─╮ │   │     │         
+                                              │                         │      │                      │      ╰─────────────┼─┼─╯   │     │         
+                                              │                         │   ╭──┼──────────────────────╯                    │ │     │     │         
+                                              │                         │   │  ╰──────────────────────────╮                │ │     │     │         
+                ╭─────────────────────────────┼─────────────────────────╯   │                             │                │ │     │     │         
+                ▼                             ▼                             ▼                             ▼                │ │     │     │         
+   ┏━ B25 ■ 0x4015b━━━━━━━━━┓    ┏━ B18 0x40152b ━━━━━━━━━┓    ┏━ B22 0x401587 ━━━━━━━━━┓    ┏━ B26 ■ 0x4015b━━━━━━━━━┓    │ │     │     │         
+   ┃ 111│ }                 ┃    ┃  89│ perror("recv err… ┃    ┃ 101│ perror("send err… ┃    ┃ 111│ }                 ┃    │ │     │     │         
+   ┃ call   __stack_chk_fa… ┃    ┃ mov    edi, 0x4020a8   ┃    ┃ mov    edi, 0x4020c9   ┃    ┃ leave                  ┃    │ │     │     │         
+   ┗━━━━━━━━━━━━━━━━━━━━━━━━┛    ┃ call   perror          ┃    ┃ call   perror          ┃    ┃ ret                    ┃    │ │     │     │         
+                                 ┃ jmp    → B23           ┃    ┗━━━━━━━━━━━━┳━━━━━━━━━━━┛    ┗━━━━━━━━━━━━━━━━━━━━━━━━┛    │ │     │     │         
+                                 ┗━━━━━━━━━━━━┳━━━━━━━━━━━┛                 │                                              │ │     │     │         
+                                              │                 ╭───────────┼──────────────────────────────────────────────┼─┼─────╯     │         
+                                              │                 │   ╭───────┼──────────────────────────────────────────────╯ │           │         
+                                              ╰──────╮          │   │       │                                                │           │         
+                                                     │       ╭──┼───┼───────┼────────────────────────────────────────────────╯           │         
+                                                     │   ╭───┼──┼───┼───────╯                                                            │         
+                                                     ▼   ▼   ▼  ▼   ▼                                                                    │         
+                                                ┏━ B23 0x401591 ━━━━━━━━━┓                                                               │         
+                                                ┃ 106│ close(client_fd)… ┃                                                               │         
+                                                ┃ mov    eax, DWORD PTR… ┃                                                               │         
+                                                ┃ mov    edi, eax        ┃                                                               │         
+                                                ┃ call   close           ┃                                                               │         
+                                                ┃ jmp    → B9            ┃                                                               │         
+                                                ┗━━━━━━━━━━━━┳━━━━━━━━━━━┛                                                               │         
+                                                             ╰───────────────────────────────────────────────────────────────────────────╯         
+                                                                                                                                                   
+ ━ fall ━ taken ━ jump ━ loop back-edge ◉ signal ▶ entry ■ exit ↻ loop head ◆n findings                                                            
+ 168 instructions · 27 blocks · 38 edges · 2 loops · max loop depth 2 · audit: clean                                                               
+  g++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0  ·  -O0  ·  -g -no-pie
