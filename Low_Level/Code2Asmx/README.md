@@ -145,7 +145,9 @@ technotheos@HP-EliteBook-840-G8-PC:~/CodeToAssembly\$ python3 Code2Asmx.py ../Te
 
 **I don't think it will look better here, so make sure to run it and see it with your eyes, it is really magnificent and gorgeous to look at.**
 
-technotheos@HP-EliteBook-840-G8-PC:~$ python3 asmx.py Tests/test.cpp --graph --trace -f main -O0 --steps 600
+# technotheos@HP-EliteBook-840-G8-PC:~$ python3 asmx.py Tests/test.cpp --graph --trace -f main -O0 --steps 600
+
+```
   ▄▀█ █▀ █▀▄▀█ ▀▄▀
   █▀█ ▄█ █░▀░█ █░█
   source ⟶ assembly  //  v2.0.0
@@ -322,3 +324,4 @@ technotheos@HP-EliteBook-840-G8-PC:~$ python3 asmx.py Tests/test.cpp --graph --t
  ━ fall ━ taken ━ jump ━ loop back-edge ◉ signal ▶ entry ■ exit ↻ loop head ◆n findings                                                            
  168 instructions · 27 blocks · 38 edges · 2 loops · max loop depth 2 · audit: clean                                                               
   g++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0  ·  -O0  ·  -g -no-pie
+  ```
